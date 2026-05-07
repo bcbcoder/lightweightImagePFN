@@ -1,0 +1,655 @@
+# test_online_image_pfn_car_bike.py
+
+import os
+import random
+import statistics
+
+import kagglehub
+import matplotlib.pyplot as plt
+import torch
+from PIL import Image
+from torch.utils.data import Dataset, DataLoader, Subset
+from torchvision import transforms
+
+from legacy_image_rule_vit import ImagePFN
+
+
+# ============================================================
+# Defaults
+# ============================================================
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+KAGGLE_DATASET = "utkarshsaxenadn/car-vs-bike-classification-dataset"
+
+TASK_SIZE = 600
+NUM_CONTEXT = 500
+IMAGE_SIZE = 64
+SEED = 123
+
+CAR_LABEL = 0
+BIKE_LABEL = 1
+
+
+# ============================================================
+# Reproducibility
+# ============================================================
+
+def seed_everything(seed):
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+# ============================================================
+# Model loading
+# ============================================================
+
+def get_ckpt_value(ckpt, key, default):
+    return ckpt[key] if key in ckpt else default
+
+
+def load_image_pfn_from_checkpoint(checkpoint_path, device):
+    ckpt = torch.load(checkpoint_path, map_location=device)
+
+    model = ImagePFN(
+        image_size=get_ckpt_value(ckpt, "image_size", IMAGE_SIZE),
+        patch_size=get_ckpt_value(ckpt, "patch_size", 8),
+
+        image_embed_dim=get_ckpt_value(ckpt, "image_embed_dim", 256),
+        image_depth=get_ckpt_value(ckpt, "image_depth", 4),
+        image_heads=get_ckpt_value(ckpt, "image_heads", 8),
+
+        set_embed_dim=get_ckpt_value(ckpt, "set_embed_dim", 256),
+        set_depth=get_ckpt_value(ckpt, "set_depth", 4),
+        set_heads=get_ckpt_value(ckpt, "set_heads", 8),
+
+        label_embed_dim=get_ckpt_value(ckpt, "label_embed_dim", 32),
+        dropout=get_ckpt_value(ckpt, "dropout", 0.0),
+        num_classes=2,
+    ).to(device)
+
+    model.load_state_dict(ckpt["model_state_dict"], strict=True)
+    model.eval()
+
+    for p in model.parameters():
+        p.requires_grad = False
+
+    return model, ckpt
+
+
+def extract_query_logits(outputs):
+    if isinstance(outputs, dict):
+        if "query_logits" in outputs:
+            return outputs["query_logits"]
+        if "logits" in outputs:
+            return outputs["logits"]
+        raise KeyError(f"Could not find logits. Output keys: {list(outputs.keys())}")
+
+    if torch.is_tensor(outputs):
+        return outputs
+
+    raise TypeError(f"Unsupported model output type: {type(outputs)}")
+
+
+# ============================================================
+# Car/Bike dataset loading
+# ============================================================
+
+def is_image_file(path):
+    return os.path.splitext(path.lower())[1] in {
+        ".jpg",
+        ".jpeg",
+        ".png",
+        ".bmp",
+        ".webp",
+    }
+
+
+def find_car_bike_folders(root):
+    """
+    Finds car and bike folders anywhere under the Kaggle download path.
+
+    Manual labels:
+        car  -> 0
+        bike -> 1
+    """
+    car_keywords = {"car", "cars"}
+    bike_keywords = {"bike", "bikes", "motorcycle", "motorcycles"}
+
+    car_candidates = []
+    bike_candidates = []
+
+    for current_root, _dirs, files in os.walk(root):
+        image_count = sum(1 for f in files if is_image_file(f))
+
+        if image_count == 0:
+            continue
+
+        folder_name = os.path.basename(current_root).lower().strip()
+
+        if folder_name in car_keywords:
+            car_candidates.append((current_root, image_count))
+
+        if folder_name in bike_keywords:
+            bike_candidates.append((current_root, image_count))
+
+    if not car_candidates:
+        raise ValueError(
+            f"Could not find a car folder under: {root}\n"
+            f"Looked for folder names: {sorted(car_keywords)}"
+        )
+
+    if not bike_candidates:
+        raise ValueError(
+            f"Could not find a bike folder under: {root}\n"
+            f"Looked for folder names: {sorted(bike_keywords)}"
+        )
+
+    car_dir, car_count = sorted(
+        car_candidates,
+        key=lambda x: x[1],
+        reverse=True,
+    )[0]
+
+    bike_dir, bike_count = sorted(
+        bike_candidates,
+        key=lambda x: x[1],
+        reverse=True,
+    )[0]
+
+    print("Folder detection:")
+    print(f"  selected car folder:  {car_dir}")
+    print(f"  selected car count:   {car_count}")
+    print(f"  selected bike folder: {bike_dir}")
+    print(f"  selected bike count:  {bike_count}")
+
+    return car_dir, bike_dir
+
+
+def collect_image_paths(folder):
+    paths = []
+
+    for current_root, _dirs, files in os.walk(folder):
+        for f in files:
+            path = os.path.join(current_root, f)
+            if is_image_file(path):
+                paths.append(path)
+
+    return sorted(paths)
+
+
+class CarBikeDataset(Dataset):
+    """
+    Explicit manual labels:
+
+        car  = 0
+        bike = 1
+    """
+
+    def __init__(self, car_paths, bike_paths, image_size=64):
+        self.samples = []
+
+        for path in car_paths:
+            self.samples.append(
+                {
+                    "path": path,
+                    "label": CAR_LABEL,
+                    "class_name": "car",
+                }
+            )
+
+        for path in bike_paths:
+            self.samples.append(
+                {
+                    "path": path,
+                    "label": BIKE_LABEL,
+                    "class_name": "bike",
+                }
+            )
+
+        self.transform = transforms.Compose([
+            transforms.Resize((image_size, image_size)),
+            transforms.ToTensor(),
+        ])
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        item = self.samples[idx]
+
+        img = Image.open(item["path"]).convert("RGB")
+        img = self.transform(img)
+
+        label = torch.tensor(item["label"], dtype=torch.long)
+
+        return img, label
+
+    def get_sample_info(self, idx):
+        return self.samples[idx]
+
+
+def load_car_bike_dataset_from_kaggle(image_size):
+    dataset_path = kagglehub.dataset_download(KAGGLE_DATASET)
+    print(f"Kaggle dataset path: {dataset_path}")
+
+    car_dir, bike_dir = find_car_bike_folders(dataset_path)
+
+    car_paths = collect_image_paths(car_dir)
+    bike_paths = collect_image_paths(bike_dir)
+
+    print("Collected image paths:")
+    print(f"  car images found:  {len(car_paths)}")
+    print(f"  bike images found: {len(bike_paths)}")
+    print("Manual label map:")
+    print("  car  -> 0")
+    print("  bike -> 1")
+
+    if len(car_paths) == 0:
+        raise ValueError("Found zero car images.")
+
+    if len(bike_paths) == 0:
+        raise ValueError("Found zero bike images.")
+
+    dataset = CarBikeDataset(
+        car_paths=car_paths,
+        bike_paths=bike_paths,
+        image_size=image_size,
+    )
+
+    return dataset
+
+
+# ============================================================
+# Preview grid
+# ============================================================
+
+def save_preview_grid(dataset, save_path="car_bike_preview_5_each.png"):
+    """
+    Saves a quick visual check:
+
+        top row: 5 cars, label 0
+        bottom row: 5 bikes, label 1
+    """
+    car_indices = []
+    bike_indices = []
+
+    for idx in range(len(dataset)):
+        info = dataset.get_sample_info(idx)
+
+        if info["label"] == CAR_LABEL and len(car_indices) < 5:
+            car_indices.append(idx)
+
+        elif info["label"] == BIKE_LABEL and len(bike_indices) < 5:
+            bike_indices.append(idx)
+
+        if len(car_indices) >= 5 and len(bike_indices) >= 5:
+            break
+
+    if len(car_indices) < 5 or len(bike_indices) < 5:
+        raise ValueError(
+            f"Could not find 5 cars and 5 bikes. "
+            f"cars={len(car_indices)}, bikes={len(bike_indices)}"
+        )
+
+    print("Preview examples selected:")
+    print("  Cars / label 0:")
+    for idx in car_indices:
+        info = dataset.get_sample_info(idx)
+        print(f"    idx={idx} | label={info['label']} | path={info['path']}")
+
+    print("  Bikes / label 1:")
+    for idx in bike_indices:
+        info = dataset.get_sample_info(idx)
+        print(f"    idx={idx} | label={info['label']} | path={info['path']}")
+
+    preview_indices = car_indices + bike_indices
+
+    fig, axes = plt.subplots(2, 5, figsize=(10, 4))
+
+    for plot_idx, dataset_idx in enumerate(preview_indices):
+        img, label = dataset[dataset_idx]
+        info = dataset.get_sample_info(dataset_idx)
+
+        row = plot_idx // 5
+        col = plot_idx % 5
+
+        img_np = img.permute(1, 2, 0).detach().cpu().numpy()
+
+        axes[row, col].imshow(img_np)
+        axes[row, col].axis("off")
+
+        axes[row, col].set_title(
+            f"{info['class_name']} / {int(label.item())}",
+            fontsize=9,
+        )
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+    print(f"Saved preview grid: {save_path}")
+
+
+# ============================================================
+# Task sampling
+# ============================================================
+
+def sample_random_task_indices(dataset, task_size, seed):
+    """
+    Randomly mixes all car/bike samples and samples task_size examples.
+
+    This does not force 300/300 balance. Since the dataset is roughly 2000/2000,
+    random 600 should usually be close to balanced.
+    """
+    rng = random.Random(seed)
+
+    all_indices = list(range(len(dataset)))
+    rng.shuffle(all_indices)
+
+    if len(all_indices) < task_size:
+        raise ValueError(
+            f"Dataset only has {len(all_indices)} images, but task_size={task_size}."
+        )
+
+    return all_indices[:task_size]
+
+
+def load_indices_as_tensors(dataset, indices, batch_size, device):
+    subset = Subset(dataset, indices)
+
+    loader = DataLoader(
+        subset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=False,
+    )
+
+    images_list = []
+    labels_list = []
+
+    for images, labels in loader:
+        images_list.append(images)
+        labels_list.append(labels)
+
+    images = torch.cat(images_list, dim=0).to(device)
+    labels = torch.cat(labels_list, dim=0).long().to(device)
+
+    return images, labels
+
+
+# ============================================================
+# Evaluation
+# ============================================================
+
+@torch.no_grad()
+def evaluate_single_task(model, images, labels, num_context, device):
+    """
+    One ImagePFN online task.
+
+    context:
+        images[:num_context], labels[:num_context]
+
+    query:
+        images[num_context:], labels[num_context:]
+    """
+    context_images = images[:num_context].unsqueeze(0).to(device)
+    context_labels = labels[:num_context].unsqueeze(0).long().to(device)
+
+    query_images = images[num_context:].unsqueeze(0).to(device)
+    query_labels = labels[num_context:].long().to(device)
+
+    outputs = model(
+        context_images=context_images,
+        context_labels=context_labels,
+        query_images=query_images,
+    )
+
+    logits = extract_query_logits(outputs)
+
+    if logits.dim() == 3:
+        logits = logits.squeeze(0)
+
+    probs = torch.softmax(logits, dim=-1)
+    preds = probs.argmax(dim=-1)
+
+    acc = (preds == query_labels).float().mean().item()
+    correct = int((preds == query_labels).sum().item())
+    total = int(query_labels.numel())
+
+    return {
+        "query_acc": acc,
+        "correct": correct,
+        "total": total,
+        "preds": preds.detach().cpu(),
+        "query_labels": query_labels.detach().cpu(),
+        "probs": probs.detach().cpu(),
+    }
+
+
+def majority_baseline(context_labels, query_labels):
+    context_zeros = int((context_labels == 0).sum().item())
+    context_ones = int((context_labels == 1).sum().item())
+
+    majority_label = 1 if context_ones >= context_zeros else 0
+
+    preds = torch.full_like(query_labels, fill_value=majority_label)
+    acc = (preds == query_labels).float().mean().item()
+
+    return acc, majority_label, context_zeros, context_ones
+
+
+def run_one_seed(
+    model,
+    dataset,
+    task_size,
+    num_context,
+    seed,
+    load_batch_size,
+    device,
+):
+    task_indices = sample_random_task_indices(
+        dataset=dataset,
+        task_size=task_size,
+        seed=seed,
+    )
+
+    images, labels = load_indices_as_tensors(
+        dataset=dataset,
+        indices=task_indices,
+        batch_size=load_batch_size,
+        device=device,
+    )
+
+    context_labels = labels[:num_context]
+    query_labels = labels[num_context:]
+
+    task_zeros = int((labels == 0).sum().item())
+    task_ones = int((labels == 1).sum().item())
+
+    ctx_zeros = int((context_labels == 0).sum().item())
+    ctx_ones = int((context_labels == 1).sum().item())
+
+    qry_zeros = int((query_labels == 0).sum().item())
+    qry_ones = int((query_labels == 1).sum().item())
+
+    base_acc, majority_label, _, _ = majority_baseline(
+        context_labels=context_labels,
+        query_labels=query_labels,
+    )
+
+    results = evaluate_single_task(
+        model=model,
+        images=images,
+        labels=labels,
+        num_context=num_context,
+        device=device,
+    )
+
+    return {
+        "seed": seed,
+        "query_acc": float(results["query_acc"]),
+        "correct": int(results["correct"]),
+        "total": int(results["total"]),
+        "majority_baseline_acc": float(base_acc),
+        "improvement_vs_majority": float(results["query_acc"] - base_acc),
+        "majority_label": int(majority_label),
+        "task_cars": task_zeros,
+        "task_bikes": task_ones,
+        "context_cars": ctx_zeros,
+        "context_bikes": ctx_ones,
+        "query_cars": qry_zeros,
+        "query_bikes": qry_ones,
+    }
+
+
+# ============================================================
+# Main
+# ============================================================
+
+def main(
+    model_checkpoint,
+    task_size=600,
+    num_context=500,
+    base_seed=123,
+    num_seeds=30,
+    load_batch_size=128,
+    preview_path="car_bike_preview_5_each.png",
+):
+    seed_everything(base_seed)
+
+    if num_context >= task_size:
+        raise ValueError("num_context must be smaller than task_size.")
+
+    print(f"DEVICE: {DEVICE}")
+    print(f"Model checkpoint: {model_checkpoint}")
+    print(f"TASK_SIZE: {task_size}")
+    print(f"NUM_CONTEXT: {num_context}")
+    print(f"NUM_QUERY: {task_size - num_context}")
+    print(f"NUM_SEEDS: {num_seeds}")
+    print(f"BASE_SEED: {base_seed}")
+    print("Labels: car=0, bike=1")
+
+    # --------------------------------------------------------
+    # 1. Load ImagePFN once
+    # --------------------------------------------------------
+
+    model, ckpt = load_image_pfn_from_checkpoint(
+        checkpoint_path=model_checkpoint,
+        device=DEVICE,
+    )
+
+    image_size = get_ckpt_value(ckpt, "image_size", IMAGE_SIZE)
+
+    print("Loaded ImagePFN.")
+    print(f"Checkpoint epoch: {ckpt.get('epoch', 'unknown')}")
+    print(f"Checkpoint global_step: {ckpt.get('global_step', 'unknown')}")
+    print(f"Image size used for resize: {image_size}")
+
+    # --------------------------------------------------------
+    # 2. Download/load car-bike dataset once
+    # --------------------------------------------------------
+
+    dataset = load_car_bike_dataset_from_kaggle(
+        image_size=image_size,
+    )
+
+    print(f"Total car+bike images: {len(dataset)}")
+
+    # --------------------------------------------------------
+    # 3. Preview once
+    # --------------------------------------------------------
+
+    save_preview_grid(
+        dataset=dataset,
+        save_path=preview_path,
+    )
+
+    # --------------------------------------------------------
+    # 4. Run repeated random task seeds
+    # --------------------------------------------------------
+
+    all_results = []
+
+    print("\nRunning repeated random 600-sample tasks:")
+    print("-" * 90)
+
+    for seed_offset in range(num_seeds):
+        seed = base_seed + seed_offset
+
+        result = run_one_seed(
+            model=model,
+            dataset=dataset,
+            task_size=task_size,
+            num_context=num_context,
+            seed=seed,
+            load_batch_size=load_batch_size,
+            device=DEVICE,
+        )
+
+        all_results.append(result)
+
+        print(
+            f"seed {seed:04d} | "
+            f"acc {result['query_acc']:.4f} "
+            f"({result['correct']}/{result['total']}) | "
+            f"baseline {result['majority_baseline_acc']:.4f} | "
+            f"improve {result['improvement_vs_majority']:+.4f} | "
+            f"query cars/bikes {result['query_cars']}/{result['query_bikes']} | "
+            f"context cars/bikes {result['context_cars']}/{result['context_bikes']}"
+        )
+
+    # --------------------------------------------------------
+    # 5. Summary
+    # --------------------------------------------------------
+
+    accs = [r["query_acc"] for r in all_results]
+    baselines = [r["majority_baseline_acc"] for r in all_results]
+    improvements = [r["improvement_vs_majority"] for r in all_results]
+
+    mean_acc = statistics.mean(accs)
+    std_acc = statistics.stdev(accs) if len(accs) > 1 else 0.0
+
+    mean_baseline = statistics.mean(baselines)
+    std_baseline = statistics.stdev(baselines) if len(baselines) > 1 else 0.0
+
+    mean_improvement = statistics.mean(improvements)
+    std_improvement = statistics.stdev(improvements) if len(improvements) > 1 else 0.0
+
+    total_correct = sum(r["correct"] for r in all_results)
+    total_query = sum(r["total"] for r in all_results)
+    pooled_acc = total_correct / max(total_query, 1)
+
+    print("\n" + "=" * 90)
+    print("30-seed summary")
+    print("=" * 90)
+    print(f"mean_query_acc:              {mean_acc:.4f}")
+    print(f"std_query_acc:               {std_acc:.4f}")
+    print(f"min_query_acc:               {min(accs):.4f}")
+    print(f"max_query_acc:               {max(accs):.4f}")
+    print(f"pooled_query_acc:            {pooled_acc:.4f} ({total_correct}/{total_query})")
+
+    print(f"mean_majority_baseline_acc:  {mean_baseline:.4f}")
+    print(f"std_majority_baseline_acc:   {std_baseline:.4f}")
+
+    print(f"mean_improvement:            {mean_improvement:+.4f}")
+    print(f"std_improvement:             {std_improvement:.4f}")
+
+    print("\nInterpretation:")
+    
+
+
+if __name__ == "__main__":
+    MODEL_CHECKPOINT = "image_pfn2_checkpoints_13branch_2_8d/image_pfn_epoch_222_step_001554.pth"
+
+    main(
+        model_checkpoint=MODEL_CHECKPOINT,
+        task_size=600,
+        num_context=500,
+        base_seed=123,
+        num_seeds=30,
+        load_batch_size=128,
+        preview_path="car_bike_preview_5_each.png",
+    )

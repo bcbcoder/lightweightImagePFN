@@ -1,0 +1,3021 @@
+
+import copy
+import math
+import os
+
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision import models
+
+
+# ============================================================
+# Hyperparameters
+# ============================================================
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+Z_DIM = 256
+
+IMAGE_SIZE = 64
+BASE_CHANNELS = 384
+
+# Two values per focused branch/scale chunk.
+DIMS_PER_VECTOR = 3
+
+NUM_SCALES = 2
+RESOLUTION_LEVELS = [64, 16]
+DOWNSAMPLE_STEPS_PER_LEVEL = [0, 2]
+
+FEATURE_FAMILIES = [
+    "hog",
+    "resnet18",
+    "gabor",
+    "dog",
+    "fft",
+    "steerable",
+    "vgg16_early",
+    "mobilenet_v3_small",
+    "color_hsv",
+    "soft_lbp",
+    "shape_edges",
+    "soft_contour",
+    "curvature_hessian",
+]
+NUM_FEATURE_FAMILIES = len(FEATURE_FAMILIES)
+
+# Full generator input:
+#   11 branches * 2 scales * 2D chunk = 44D
+VECTOR_DIM = NUM_FEATURE_FAMILIES * NUM_SCALES * DIMS_PER_VECTOR
+
+# Equal default weighting across feature families
+FEATURE_FAMILY_LOSS_WEIGHTS = {
+    name: 1.0 / float(NUM_FEATURE_FAMILIES)
+    for name in FEATURE_FAMILIES
+}
+
+# Two-scale weighting. 64 gets slightly more because it has more spatial detail;
+# 16 still matters strongly for coarse layout/patterns.
+LEVEL_LOSS_WEIGHTS = [0.55, 0.45]
+
+# ResNet stages at each analyzed scale.
+RESNET_STAGES_PER_LEVEL = ["layer1", "layer2"]
+
+# Very early VGG layers
+VGG_LAYER_CUTOFF_BY_LEVEL = [4, 9]
+
+# MobileNetV3-Small early feature cutoffs. Gives a different pretrained texture
+# and shape bias than ResNet/VGG while staying lightweight.
+MOBILENET_FEATURE_CUTOFF_BY_LEVEL = [3, 6]
+
+# More branches means more isolated generations per step. Keep batch modest.
+BATCH_SIZE = 32
+NUM_STEPS = 250000
+
+LR = 2e-4
+WEIGHT_DECAY = 0.0
+
+RELATIONAL_LOSS_WEIGHT = 2.4
+
+# ------------------------------------------------------------
+# HOG feature extractor parameters
+# ------------------------------------------------------------
+
+HOG_ORIENTATIONS_BY_LEVEL = [14, 9]
+HOG_PIXELS_PER_CELL_BY_LEVEL = [8, 4]
+HOG_CELLS_PER_BLOCK_BY_LEVEL = [2, 2]
+
+HOG_BLUR_KERNEL_SIZE_BY_LEVEL = [3, 3]
+HOG_BLUR_SIGMA_BY_LEVEL = [0.50, 0.25]
+
+HOG_USE_UNSIGNED_ORIENTATION_BY_LEVEL = [True, True]
+HOG_GAMMA_CORRECTION_BY_LEVEL = [True, True]
+
+HOG_EPS = 1e-6
+
+# ------------------------------------------------------------
+# Gabor feature extractor parameters
+# ------------------------------------------------------------
+
+GABOR_NUM_ORIENTATIONS_BY_LEVEL = [8, 6]
+GABOR_WAVELENGTHS_BY_LEVEL = [
+    [4.0, 8.0, 16.0],
+    [2.0, 4.0],
+]
+GABOR_KERNEL_SIZE_BY_LEVEL = [13, 7]
+GABOR_SIGMA_BY_LEVEL = [3.0, 1.2]
+GABOR_GAMMA_BY_LEVEL = [0.5, 0.7]
+GABOR_POOLED_SIZE_BY_LEVEL = [4, 2]
+GABOR_USE_ABS_RESPONSE = True
+GABOR_EPS = 1e-6
+
+# ------------------------------------------------------------
+# Difference-of-Gaussians / blob feature parameters
+# ------------------------------------------------------------
+
+DOG_SIGMAS_BY_LEVEL = [
+    [0.7, 1.2, 2.0, 3.2],
+    [0.4, 0.8, 1.4],
+]
+DOG_KERNEL_SIZE_BY_LEVEL = [11, 7]
+DOG_POOLED_SIZE_BY_LEVEL = [4, 2]
+DOG_INCLUDE_SIGNED = True
+DOG_EPS = 1e-6
+
+# ------------------------------------------------------------
+# FFT / spectrum feature parameters
+# ------------------------------------------------------------
+
+FFT_RADIAL_BINS_BY_LEVEL = [6, 4]
+FFT_ORIENTATION_BINS_BY_LEVEL = [8, 4]
+FFT_USE_LOG_MAGNITUDE = True
+FFT_EPS = 1e-6
+
+# ------------------------------------------------------------
+# Steerable gradient feature parameters
+# ------------------------------------------------------------
+
+STEERABLE_NUM_ORIENTATIONS_BY_LEVEL = [12, 8]
+STEERABLE_BLUR_KERNEL_SIZE_BY_LEVEL = [5, 3]
+STEERABLE_BLUR_SIGMA_BY_LEVEL = [1.0, 0.5]
+STEERABLE_POOLED_SIZE_BY_LEVEL = [4, 2]
+STEERABLE_INCLUDE_SIGNED_BY_LEVEL = [True, True]
+STEERABLE_EPS = 1e-6
+
+# ------------------------------------------------------------
+# HSV / color feature parameters
+# ------------------------------------------------------------
+
+COLOR_H_BINS_BY_LEVEL = [12, 8]
+COLOR_S_BINS_BY_LEVEL = [6, 4]
+COLOR_V_BINS_BY_LEVEL = [6, 4]
+COLOR_POOLED_SIZE_BY_LEVEL = [4, 2]
+COLOR_EPS = 1e-6
+
+# ------------------------------------------------------------
+# Soft-LBP texture feature parameters
+# ------------------------------------------------------------
+
+SOFT_LBP_SHARPNESS_BY_LEVEL = [12.0, 8.0]
+SOFT_LBP_POOLED_SIZE_BY_LEVEL = [4, 2]
+SOFT_LBP_INCLUDE_CODE_STATS = True
+SOFT_LBP_EPS = 1e-6
+
+# ------------------------------------------------------------
+# Shape / edge / contour feature parameters
+# ------------------------------------------------------------
+
+SHAPE_EDGE_ORIENTATION_BINS_BY_LEVEL = [12, 8]
+SHAPE_POOLED_SIZE_BY_LEVEL = [4, 2]
+SHAPE_BLUR_KERNEL_SIZE_BY_LEVEL = [3, 3]
+SHAPE_BLUR_SIGMA_BY_LEVEL = [0.6, 0.4]
+SHAPE_EPS = 1e-6
+# ------------------------------------------------------------
+# Soft contour / outline-continuity feature parameters
+# ------------------------------------------------------------
+
+SOFT_CONTOUR_BLUR_KERNEL_SIZE_BY_LEVEL = [5, 3]
+SOFT_CONTOUR_BLUR_SIGMA_BY_LEVEL = [0.9, 0.45]
+SOFT_CONTOUR_SHARPNESS_BY_LEVEL = [18.0, 12.0]
+SOFT_CONTOUR_THRESHOLD_SCALE_BY_LEVEL = [1.10, 1.00]
+SOFT_CONTOUR_POOLED_SIZE_BY_LEVEL = [4, 2]
+SOFT_CONTOUR_EPS = 1e-6
+
+# ------------------------------------------------------------
+# Hessian curvature / curve-ridge feature parameters
+# ------------------------------------------------------------
+
+CURVATURE_BLUR_KERNEL_SIZE_BY_LEVEL = [5, 3]
+CURVATURE_BLUR_SIGMA_BY_LEVEL = [1.0, 0.50]
+CURVATURE_POOLED_SIZE_BY_LEVEL = [4, 2]
+CURVATURE_INCLUDE_SIGNED_BY_LEVEL = [True, True]
+CURVATURE_EPS = 1e-6
+# ------------------------------------------------------------
+# Relative pattern diversity penalty
+# ------------------------------------------------------------
+
+PATTERN_DIVERSITY_WEIGHT = 3.0
+PATTERN_DIVERSITY_STRENGTH = 0.8
+
+# Prior keeps the generator from going visually chaotic.
+STYLE_PRIOR_WEIGHT = 4.0
+
+# ------------------------------------------------------------
+# Integer 2D chunk setup
+# ------------------------------------------------------------
+
+VECTOR_INT_MIN = 0
+VECTOR_INT_MAX = 2000
+VECTOR_INT_CENTER = 1000.0
+VECTOR_INT_SCALE = 1000.0
+VECTOR_NORM_EPS = 1e-6
+
+# 18 visual columns spanning the full cosine similarity spectrum.
+VIS_TARGET_SIMILARITIES = [
+    1.00,
+    0.875,
+    0.75,
+    0.625,
+    0.50,
+    0.375,
+    0.25,
+    0.125,
+    0.00,
+    -0.125,
+    -0.25,
+    -0.375,
+    -0.50,
+    -0.625,
+    -0.75,
+    -0.875,
+    -0.95,
+    -1.00,
+]
+
+VIS_EVERY = 250
+
+SAMPLE_SAVE_DIR = "integer_multiscale_13branch_3d_cosine_isolated_samples_div02_relat24_bs32_morediv"
+CHECKPOINT_SAVE_DIR = "integer_multiscale_13branch_3d_cosine_isolated_checkpoints_div02_relat24_bs32_morediv"
+
+# ============================================================
+# 3D vector helpers
+# ============================================================
+
+def int_to_centered_vector(y_int):
+    """
+    Converts integer values to centered values around 0.
+
+    With current settings:
+        0    -> -1.0
+        1000 ->  0.0
+        2000 ->  1.0
+
+    y_int can be [B, 3] or any shape whose values are integer-grid components.
+    """
+    return (y_int.float() - VECTOR_INT_CENTER) / VECTOR_INT_SCALE
+
+
+def centered_to_display_int(y_centered):
+    return torch.round(y_centered * VECTOR_INT_SCALE + VECTOR_INT_CENTER).long()
+
+
+def safe_normalize_vector(y):
+    """
+    Normalizes a D-dimensional chunk for cosine similarity.
+
+    If a vector is accidentally near zero, it becomes [1, 0, 0, ...]
+    instead of producing NaNs.
+    """
+    norm = y.norm(dim=1, keepdim=True)
+
+    fallback = torch.zeros_like(y)
+    fallback[:, 0:1] = 1.0
+
+    return torch.where(
+        norm > VECTOR_NORM_EPS,
+        y / norm.clamp_min(VECTOR_NORM_EPS),
+        fallback,
+    )
+
+
+def chunk_start_index(feature_family_idx, level_idx):
+    """
+    Vector layout:
+
+        [feature family 0 L0 dim0, dim1, dim2]
+        [feature family 0 L1 dim0, dim1, dim2]
+        [feature family 1 L0 dim0, dim1, dim2]
+        ...
+
+    Each chunk is 3D.
+    """
+    chunk_idx = feature_family_idx * NUM_SCALES + level_idx
+    return chunk_idx * DIMS_PER_VECTOR
+
+
+def get_feature_level_chunk(y, feature_family_idx, level_idx):
+    start = chunk_start_index(feature_family_idx, level_idx)
+    end = start + DIMS_PER_VECTOR
+    return y[:, start:end]
+
+
+def set_feature_level_chunk(y, feature_family_idx, level_idx, chunk):
+    start = chunk_start_index(feature_family_idx, level_idx)
+    end = start + DIMS_PER_VECTOR
+    y[:, start:end] = chunk
+    return y
+
+
+def make_isolated_feature_level_vector(
+    vector_chunk,
+    feature_family_idx,
+    level_idx,
+    vector_dim=VECTOR_DIM,
+):
+    """
+    Makes a zeroed full vector with only one branch/scale 3D chunk active.
+
+    vector_chunk:
+        [B, 3]
+
+    Output:
+        [B, VECTOR_DIM]
+    """
+    y = torch.zeros(
+        vector_chunk.shape[0],
+        vector_dim,
+        device=vector_chunk.device,
+        dtype=vector_chunk.dtype,
+    )
+
+    y = set_feature_level_chunk(
+        y=y,
+        feature_family_idx=feature_family_idx,
+        level_idx=level_idx,
+        chunk=vector_chunk,
+    )
+
+    return y
+
+
+def sample_integer_chunk(batch_size, device):
+    """
+    Samples one 3D integer chunk, centers/scales it to [-1, 1], then avoids
+    near-zero vectors because cosine similarity is undefined there.
+    """
+    y_int = torch.randint(
+        low=VECTOR_INT_MIN,
+        high=VECTOR_INT_MAX + 1,
+        size=(batch_size, DIMS_PER_VECTOR),
+        device=device,
+    )
+
+    y = int_to_centered_vector(y_int)
+
+    # Rare, but avoid undefined cosine around [0, 0, 0].
+    near_zero = y.norm(dim=1) < 0.05
+
+    if near_zero.any():
+        n = int(near_zero.sum().item())
+
+        replacement = torch.randn(
+            n,
+            DIMS_PER_VECTOR,
+            device=device,
+        )
+        replacement = safe_normalize_vector(replacement)
+
+        y[near_zero] = replacement
+
+    return y
+
+
+def sample_training_vector_chunk(batch_size, device):
+    """
+    TRAINING ONLY.
+
+    Samples one 3D chunk per image. This same 3D chunk is activated one
+    branch/scale at a time inside compute_isolated_branch_losses().
+    """
+    return sample_integer_chunk(
+        batch_size=batch_size,
+        device=device,
+    )
+
+
+def sample_random_full_vectors(batch_size, device):
+    """
+    Helper for experiments. Visualization/training primarily use isolated vectors.
+    """
+    chunks = []
+
+    for _feature_family_idx in range(NUM_FEATURE_FAMILIES):
+        for _level_idx in range(NUM_SCALES):
+            chunk = sample_integer_chunk(
+                batch_size=batch_size,
+                device=device,
+            )
+            chunks.append(chunk)
+
+    return torch.cat(chunks, dim=1)
+
+
+def vector_cosine_similarity_matrix(y_chunk):
+    """
+    Cosine similarity for focused 3D chunks.
+
+    y_chunk: [B, 3]
+    output: [B, B] in [-1, 1]
+    """
+    y_norm = safe_normalize_vector(y_chunk)
+    return y_norm @ y_norm.T
+
+
+def choose_3d_vectors_for_target_similarities(device):
+    """
+    Chooses exact 3D unit vectors whose cosine similarity to reference
+    [1, 0, 0] equals the requested target similarities.
+
+    For target cosine c:
+        x = c
+        remaining radius = sqrt(1 - c^2)
+
+    The remaining mass is rotated through the y/z plane so the visualization
+    actually uses 3D geometry instead of always staying in the x/y plane.
+    """
+    chosen_centered = []
+    chosen_raw = []
+    chosen_actual_sim = []
+
+    num_targets = len(VIS_TARGET_SIMILARITIES)
+
+    for idx, target in enumerate(VIS_TARGET_SIMILARITIES):
+        c = float(max(-1.0, min(1.0, target)))
+        radius = math.sqrt(max(0.0, 1.0 - c * c))
+
+        # Rotate through the orthogonal y/z plane.
+        # This keeps dot([1,0,0], vec) = c while using all 3 dimensions.
+        phi = 2.0 * math.pi * float(idx) / max(float(num_targets), 1.0)
+
+        y_val = radius * math.cos(phi)
+        z_val = radius * math.sin(phi)
+
+        vec = torch.tensor(
+            [c, y_val, z_val],
+            device=device,
+            dtype=torch.float32,
+        )
+
+        raw = centered_to_display_int(vec)
+
+        chosen_centered.append(vec)
+        chosen_raw.append(raw)
+        chosen_actual_sim.append(torch.tensor(c, device=device, dtype=torch.float32))
+
+    chosen_centered = torch.stack(chosen_centered, dim=0)
+    chosen_raw = torch.stack(chosen_raw, dim=0)
+    chosen_actual_sim = torch.stack(chosen_actual_sim, dim=0)
+
+    return chosen_centered, chosen_raw, chosen_actual_sim
+
+
+def branch_level_weight(feature_family_name, level_idx):
+    feature_weight = float(FEATURE_FAMILY_LOSS_WEIGHTS[feature_family_name])
+    level_weight = float(LEVEL_LOSS_WEIGHTS[level_idx])
+    return feature_weight * level_weight
+
+
+# ============================================================
+# Shared image-processing helpers
+# ============================================================
+
+def make_gaussian_kernel(kernel_size, sigma, channels, device):
+    assert kernel_size % 2 == 1
+
+    radius = kernel_size // 2
+    coords = torch.arange(-radius, radius + 1, device=device).float()
+    yy, xx = torch.meshgrid(coords, coords, indexing="ij")
+
+    kernel = torch.exp(-(xx ** 2 + yy ** 2) / (2.0 * sigma ** 2))
+    kernel = kernel / kernel.sum()
+
+    kernel = kernel.view(1, 1, kernel_size, kernel_size)
+    kernel = kernel.repeat(channels, 1, 1, 1)
+
+    return kernel
+
+
+def gaussian_blur(x, kernel_size=3, sigma=0.8):
+    _B, C, _H, _W = x.shape
+
+    kernel = make_gaussian_kernel(
+        kernel_size=kernel_size,
+        sigma=sigma,
+        channels=C,
+        device=x.device,
+    )
+
+    x = F.conv2d(
+        x,
+        kernel,
+        padding=kernel_size // 2,
+        groups=C,
+    )
+
+    return x
+
+
+def gaussian_downsample_once(x, kernel_size=5, sigma=1.0):
+    x = gaussian_blur(
+        x,
+        kernel_size=kernel_size,
+        sigma=sigma,
+    )
+
+    x = F.interpolate(
+        x,
+        scale_factor=0.5,
+        mode="bilinear",
+        align_corners=False,
+    )
+
+    return x
+
+
+def gaussian_downsample_steps(x, steps, kernel_size=5, sigma=1.0):
+    current = x
+
+    for _ in range(int(steps)):
+        current = gaussian_downsample_once(
+            current,
+            kernel_size=kernel_size,
+            sigma=sigma,
+        )
+
+    return current
+
+
+def build_image_pyramid(imgs):
+    """
+    Builds analyzed image levels:
+
+        L0: 64x64
+        L1: 16x16
+    """
+    pyramid = []
+
+    for steps in DOWNSAMPLE_STEPS_PER_LEVEL:
+        x_level = gaussian_downsample_steps(
+            imgs,
+            steps=steps,
+            kernel_size=5,
+            sigma=1.0,
+        )
+        pyramid.append(x_level)
+
+    return pyramid
+
+
+def rgb_01(x):
+    return ((x + 1.0) / 2.0).clamp(0.0, 1.0)
+
+
+def rgb_to_gray_01(x):
+    x = rgb_01(x)
+
+    gray = (
+        0.2989 * x[:, 0:1]
+        + 0.5870 * x[:, 1:2]
+        + 0.1140 * x[:, 2:3]
+    )
+
+    return gray
+
+
+def rgb_to_hsv_01(x, eps=1e-6):
+    """
+    Differentiable-ish RGB to HSV for x in [-1, 1].
+    Returns HSV in [0, 1]. Hue has piecewise max-channel logic, which is fine
+    for this frozen feature loss use case.
+    """
+    rgb = rgb_01(x)
+    r = rgb[:, 0:1]
+    g = rgb[:, 1:2]
+    b = rgb[:, 2:3]
+
+    maxc, _ = rgb.max(dim=1, keepdim=True)
+    minc, _ = rgb.min(dim=1, keepdim=True)
+    delta = maxc - minc
+
+    v = maxc
+    s = delta / (maxc + eps)
+
+    hr = torch.remainder((g - b) / (delta + eps), 6.0)
+    hg = ((b - r) / (delta + eps)) + 2.0
+    hb = ((r - g) / (delta + eps)) + 4.0
+
+    is_r = (maxc == r).float()
+    is_g = (maxc == g).float()
+    is_b = (maxc == b).float()
+
+    h = (is_r * hr + is_g * hg + is_b * hb) / 6.0
+    h = torch.remainder(h, 1.0)
+    h = torch.where(delta > eps, h, torch.zeros_like(h))
+
+    return torch.cat([h, s, v], dim=1)
+
+
+def soft_histogram_01(values, bins, eps=1e-6):
+    """
+    Soft triangular histogram for values in [0, 1].
+    values: [B, 1, H, W]
+    output: [B, bins]
+    """
+    B = values.shape[0]
+    centers = torch.linspace(0.0, 1.0, steps=bins, device=values.device).view(1, bins, 1, 1)
+    width = 1.0 / max(float(bins - 1), 1.0)
+    weights = F.relu(1.0 - torch.abs(values - centers) / (width + eps))
+    hist = weights.mean(dim=(2, 3))
+    hist = hist / (hist.sum(dim=1, keepdim=True) + eps)
+    return hist.view(B, bins)
+
+
+# ============================================================
+# Wavelet-tied generator
+# ============================================================
+
+def make_wavelet_bank(device):
+    filters = []
+
+    filters.append(torch.tensor([[-1, -1, -1],
+                                 [ 0,  0,  0],
+                                 [ 1,  1,  1]], dtype=torch.float32))
+
+    filters.append(torch.tensor([[-1, 0, 1],
+                                 [-1, 0, 1],
+                                 [-1, 0, 1]], dtype=torch.float32))
+
+    filters.append(torch.tensor([[ 0,  1,  1],
+                                 [-1,  0,  1],
+                                 [-1, -1,  0]], dtype=torch.float32))
+
+    filters.append(torch.tensor([[ 1,  1,  0],
+                                 [ 1,  0, -1],
+                                 [ 0, -1, -1]], dtype=torch.float32))
+
+    filters.append(torch.tensor([[ 0, -1,  0],
+                                 [-1,  4, -1],
+                                 [ 0, -1,  0]], dtype=torch.float32))
+
+    filters.append(torch.tensor([[-1, -1, -1],
+                                 [-1,  8, -1],
+                                 [-1, -1, -1]], dtype=torch.float32))
+
+    bank = torch.stack(filters, dim=0).to(device)
+    bank = bank / (bank.flatten(1).norm(dim=1).view(-1, 1, 1) + 1e-8)
+    return bank
+
+
+class TiedWaveletConv2d(nn.Module):
+    def __init__(self, in_channels, out_channels, trainable=True):
+        super().__init__()
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+
+        self.amplitude = nn.Parameter(
+            torch.randn(out_channels, in_channels, 1, 1) * 0.8,
+            requires_grad=trainable,
+        )
+
+        self.bias = nn.Parameter(
+            torch.zeros(out_channels),
+            requires_grad=trainable,
+        )
+
+        self.register_buffer(
+            "wavelet_indices",
+            torch.empty(in_channels, dtype=torch.long),
+        )
+
+    def reset_wavelets(self, bank_size, device):
+        self.wavelet_indices = torch.randint(
+            low=0,
+            high=bank_size,
+            size=(self.in_channels,),
+            device=device,
+        )
+
+    def forward(self, x, wavelet_bank):
+        selected = wavelet_bank[self.wavelet_indices]
+        selected = selected.unsqueeze(0)
+        weight = self.amplitude * selected
+        return F.conv2d(x, weight, bias=self.bias, padding=1)
+
+
+class OrientedBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, trainable=True):
+        super().__init__()
+
+        self.conv = TiedWaveletConv2d(in_ch, out_ch, trainable=trainable)
+        self.to_style = nn.Linear(512, out_ch)
+        self.norm = nn.InstanceNorm2d(out_ch, affine=False)
+        self.act = nn.LeakyReLU(0.2, inplace=True)
+
+    def reset_wavelets(self, bank_size, device):
+        self.conv.reset_wavelets(bank_size, device)
+
+    def forward(self, x, w, wavelet_bank):
+        x = self.conv(x, wavelet_bank)
+        x = self.norm(x)
+
+        style = self.to_style(w).view(w.shape[0], -1, 1, 1)
+        x = x * (1.0 + style)
+
+        x = self.act(x)
+        return x
+
+
+class StyleGANOrientedGenerator(nn.Module):
+    def __init__(
+        self,
+        z_dim=256,
+        vector_dim=78,
+        image_size=64,
+        base_channels=384,
+        trainable=True,
+    ):
+        super().__init__()
+
+        assert image_size in [32, 64, 128, 256]
+
+        self.z_dim = z_dim
+        self.vector_dim = vector_dim
+        self.image_size = image_size
+
+        input_dim = z_dim + vector_dim
+
+        self.mapping = nn.Sequential(
+            nn.Linear(input_dim, 512),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(512, 512),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(512, 512),
+        )
+
+        self.const = nn.Parameter(
+            torch.randn(1, base_channels, 4, 4),
+            requires_grad=trainable,
+        )
+
+        channels = {
+            4: base_channels,
+            8: base_channels,
+            16: base_channels // 2,
+            32: base_channels // 4,
+            64: base_channels // 8,
+            128: base_channels // 16,
+            256: base_channels // 32,
+        }
+
+        blocks = []
+        res = 8
+        in_ch = channels[4]
+
+        while res <= image_size:
+            out_ch = max(channels[res], 16)
+            blocks.append(OrientedBlock(in_ch, out_ch, trainable=trainable))
+            in_ch = out_ch
+            res *= 2
+
+        self.blocks = nn.ModuleList(blocks)
+        self.to_rgb = nn.Conv2d(in_ch, 3, kernel_size=1)
+
+        self.register_buffer("wavelet_bank", torch.empty(1))
+
+    def reset_wavelets(self, device):
+        self.wavelet_bank = make_wavelet_bank(device)
+        bank_size = self.wavelet_bank.shape[0]
+
+        for block in self.blocks:
+            block.reset_wavelets(bank_size, device)
+
+    def forward(self, z, y):
+        inp = torch.cat([z, y], dim=1)
+        w = self.mapping(inp)
+
+        x = self.const.repeat(z.shape[0], 1, 1, 1)
+
+        for block in self.blocks:
+            x = F.interpolate(
+                x,
+                scale_factor=2,
+                mode="bilinear",
+                align_corners=False,
+            )
+            x = block(x, w, self.wavelet_bank)
+
+        x = self.to_rgb(x)
+        x = torch.tanh(x)
+        return x
+
+
+# ============================================================
+# Feature extractors
+# ============================================================
+class FrozenSoftContourFeatures(nn.Module):
+    """
+    Differentiable contour/outline branch.
+
+    This avoids hard Canny/contour tracing. It builds a soft contour map from
+    edge magnitude, then measures boundary placement, outline continuity,
+    isolated contour speckles, and distance-from-contour context.
+    """
+    def __init__(
+        self,
+        blur_kernel_size=5,
+        blur_sigma=0.9,
+        sharpness=18.0,
+        threshold_scale=1.10,
+        pooled_size=4,
+        eps=1e-6,
+    ):
+        super().__init__()
+
+        self.blur_kernel_size = blur_kernel_size
+        self.blur_sigma = blur_sigma
+        self.sharpness = sharpness
+        self.threshold_scale = threshold_scale
+        self.pooled_size = pooled_size
+        self.eps = eps
+
+        gx = torch.tensor(
+            [[-1, 0, 1],
+             [-2, 0, 2],
+             [-1, 0, 1]],
+            dtype=torch.float32,
+        ).view(1, 1, 3, 3)
+
+        gy = torch.tensor(
+            [[-1, -2, -1],
+             [ 0,  0,  0],
+             [ 1,  2,  1]],
+            dtype=torch.float32,
+        ).view(1, 1, 3, 3)
+
+        self.register_buffer("sobel_x", gx)
+        self.register_buffer("sobel_y", gy)
+
+    def forward(self, x):
+        gray = rgb_to_gray_01(x)
+        gray = gaussian_blur(
+            gray,
+            kernel_size=self.blur_kernel_size,
+            sigma=self.blur_sigma,
+        )
+
+        gx = F.conv2d(gray, self.sobel_x, padding=1)
+        gy = F.conv2d(gray, self.sobel_y, padding=1)
+
+        edge_mag = torch.sqrt(gx.pow(2) + gy.pow(2) + self.eps)
+
+        # Adaptive soft threshold per image.
+        # This gives contour-like behavior without killing gradients.
+        edge_mean = edge_mag.mean(dim=(2, 3), keepdim=True)
+        edge_std = edge_mag.std(dim=(2, 3), keepdim=True, unbiased=False)
+        threshold = self.threshold_scale * edge_mean + 0.25 * edge_std
+
+        contour = torch.sigmoid(self.sharpness * (edge_mag - threshold))
+
+        # Continuity proxy: favors contour pixels that agree with nearby contour mass.
+        local_mass = F.avg_pool2d(
+            contour,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+        )
+
+        continuity = contour * local_mass
+        isolatedness = contour * (1.0 - local_mass)
+
+        # Soft distance/context proxies. Not a true distance transform, but gives
+        # the branch awareness of how broad regions sit relative to outlines.
+        inv_contour = 1.0 - contour
+        dist_1 = gaussian_blur(inv_contour, kernel_size=3, sigma=0.7)
+        dist_2 = gaussian_blur(inv_contour, kernel_size=5, sigma=1.3)
+        dist_3 = gaussian_blur(inv_contour, kernel_size=7, sigma=2.0)
+
+        maps = torch.cat(
+            [
+                contour,
+                edge_mag * contour,
+                continuity,
+                isolatedness,
+                dist_1,
+                dist_2,
+                dist_3,
+            ],
+            dim=1,
+        )
+
+        pooled = F.adaptive_avg_pool2d(
+            maps,
+            output_size=(self.pooled_size, self.pooled_size),
+        ).flatten(1)
+
+        global_stats = torch.cat(
+            [
+                contour.mean(dim=(2, 3)),
+                contour.std(dim=(2, 3), unbiased=False),
+                continuity.mean(dim=(2, 3)),
+                isolatedness.mean(dim=(2, 3)),
+                edge_mag.mean(dim=(2, 3)),
+                edge_mag.std(dim=(2, 3), unbiased=False),
+            ],
+            dim=1,
+        )
+
+        feats = torch.cat([pooled, global_stats], dim=1)
+        feats = F.normalize(feats, dim=1)
+        return feats
+
+
+class FrozenCurvatureHessianFeatures(nn.Module):
+    """
+    Differentiable curve/curvature branch.
+
+    Uses second derivatives and Hessian eigenvalue statistics to capture arcs,
+    ridges, valleys, bends, and curve-like structure.
+    """
+    def __init__(
+        self,
+        blur_kernel_size=5,
+        blur_sigma=1.0,
+        pooled_size=4,
+        include_signed=True,
+        eps=1e-6,
+    ):
+        super().__init__()
+
+        self.blur_kernel_size = blur_kernel_size
+        self.blur_sigma = blur_sigma
+        self.pooled_size = pooled_size
+        self.include_signed = include_signed
+        self.eps = eps
+
+        dxx = torch.tensor(
+            [[0, 0, 0],
+             [1, -2, 1],
+             [0, 0, 0]],
+            dtype=torch.float32,
+        ).view(1, 1, 3, 3)
+
+        dyy = torch.tensor(
+            [[0, 1, 0],
+             [0, -2, 0],
+             [0, 1, 0]],
+            dtype=torch.float32,
+        ).view(1, 1, 3, 3)
+
+        dxy = torch.tensor(
+            [[ 1, 0, -1],
+             [ 0, 0,  0],
+             [-1, 0,  1]],
+            dtype=torch.float32,
+        ).view(1, 1, 3, 3) * 0.25
+
+        gx = torch.tensor(
+            [[-1, 0, 1],
+             [-2, 0, 2],
+             [-1, 0, 1]],
+            dtype=torch.float32,
+        ).view(1, 1, 3, 3)
+
+        gy = torch.tensor(
+            [[-1, -2, -1],
+             [ 0,  0,  0],
+             [ 1,  2,  1]],
+            dtype=torch.float32,
+        ).view(1, 1, 3, 3)
+
+        self.register_buffer("dxx", dxx)
+        self.register_buffer("dyy", dyy)
+        self.register_buffer("dxy", dxy)
+        self.register_buffer("sobel_x", gx)
+        self.register_buffer("sobel_y", gy)
+
+    def forward(self, x):
+        gray = rgb_to_gray_01(x)
+        gray = gaussian_blur(
+            gray,
+            kernel_size=self.blur_kernel_size,
+            sigma=self.blur_sigma,
+        )
+
+        ixx = F.conv2d(gray, self.dxx, padding=1)
+        iyy = F.conv2d(gray, self.dyy, padding=1)
+        ixy = F.conv2d(gray, self.dxy, padding=1)
+
+        gx = F.conv2d(gray, self.sobel_x, padding=1)
+        gy = F.conv2d(gray, self.sobel_y, padding=1)
+
+        grad_mag = torch.sqrt(gx.pow(2) + gy.pow(2) + self.eps)
+
+        trace = ixx + iyy
+        det = ixx * iyy - ixy.pow(2)
+
+        disc = torch.sqrt(
+            (ixx - iyy).pow(2)
+            + 4.0 * ixy.pow(2)
+            + self.eps
+        )
+
+        lambda_1 = 0.5 * (trace + disc)
+        lambda_2 = 0.5 * (trace - disc)
+
+        curvedness = torch.sqrt(
+            lambda_1.pow(2)
+            + lambda_2.pow(2)
+            + self.eps
+        )
+
+        # Ridge/valley proxies for curved strokes and arc-like structures.
+        ridge = F.relu(-lambda_2) * grad_mag
+        valley = F.relu(lambda_1) * grad_mag
+        saddle = det.abs()
+
+        # Shape-index-like cue, roughly in [-1, 1].
+        shape_index = (2.0 / math.pi) * torch.atan2(
+            lambda_1 + lambda_2,
+            lambda_1 - lambda_2 + self.eps,
+        )
+
+        maps = [
+            lambda_1.abs(),
+            lambda_2.abs(),
+            curvedness,
+            ridge,
+            valley,
+            saddle,
+            shape_index.abs(),
+            grad_mag * curvedness,
+        ]
+
+        if self.include_signed:
+            maps.extend(
+                [
+                    lambda_1,
+                    lambda_2,
+                    trace,
+                    det,
+                    shape_index,
+                ]
+            )
+
+        maps = torch.cat(maps, dim=1)
+
+        pooled = F.adaptive_avg_pool2d(
+            maps,
+            output_size=(self.pooled_size, self.pooled_size),
+        ).flatten(1)
+
+        global_stats = torch.cat(
+            [
+                curvedness.mean(dim=(2, 3)),
+                curvedness.std(dim=(2, 3), unbiased=False),
+                ridge.mean(dim=(2, 3)),
+                valley.mean(dim=(2, 3)),
+                saddle.mean(dim=(2, 3)),
+                shape_index.mean(dim=(2, 3)),
+                shape_index.std(dim=(2, 3), unbiased=False),
+            ],
+            dim=1,
+        )
+
+        feats = torch.cat([pooled, global_stats], dim=1)
+        feats = F.normalize(feats, dim=1)
+        return feats
+
+class FrozenHOGFeatures(nn.Module):
+    def __init__(
+        self,
+        image_size=64,
+        orientations=9,
+        pixels_per_cell=8,
+        cells_per_block=2,
+        blur_kernel_size=3,
+        blur_sigma=0.8,
+        use_unsigned_orientation=True,
+        gamma_correction=True,
+        eps=1e-6,
+    ):
+        super().__init__()
+
+        assert image_size % pixels_per_cell == 0
+        assert cells_per_block >= 1
+
+        self.image_size = image_size
+        self.orientations = orientations
+        self.pixels_per_cell = pixels_per_cell
+        self.cells_per_block = cells_per_block
+        self.blur_kernel_size = blur_kernel_size
+        self.blur_sigma = blur_sigma
+        self.use_unsigned_orientation = use_unsigned_orientation
+        self.gamma_correction = gamma_correction
+        self.eps = eps
+
+        gx = torch.tensor(
+            [[-1, 0, 1],
+             [-2, 0, 2],
+             [-1, 0, 1]],
+            dtype=torch.float32,
+        ).view(1, 1, 3, 3)
+
+        gy = torch.tensor(
+            [[-1, -2, -1],
+             [ 0,  0,  0],
+             [ 1,  2,  1]],
+            dtype=torch.float32,
+        ).view(1, 1, 3, 3)
+
+        self.register_buffer("sobel_x", gx)
+        self.register_buffer("sobel_y", gy)
+
+        if use_unsigned_orientation:
+            max_angle = math.pi
+        else:
+            max_angle = 2.0 * math.pi
+
+        centers = torch.linspace(
+            0.0,
+            max_angle,
+            steps=orientations + 1,
+            dtype=torch.float32,
+        )[:-1]
+
+        self.register_buffer("bin_centers", centers.view(1, orientations, 1, 1))
+        self.max_angle = max_angle
+        self.bin_width = max_angle / float(orientations)
+
+        self.eval()
+
+    def forward(self, x):
+        gray = rgb_to_gray_01(x)
+
+        if self.gamma_correction:
+            gray = torch.sqrt(gray + self.eps)
+
+        if self.blur_kernel_size is not None and self.blur_kernel_size > 1:
+            gray = gaussian_blur(
+                gray,
+                kernel_size=self.blur_kernel_size,
+                sigma=self.blur_sigma,
+            )
+
+        grad_x = F.conv2d(gray, self.sobel_x, padding=1)
+        grad_y = F.conv2d(gray, self.sobel_y, padding=1)
+
+        magnitude = torch.sqrt(grad_x.pow(2) + grad_y.pow(2) + self.eps)
+        angle = torch.atan2(grad_y, grad_x)
+
+        if self.use_unsigned_orientation:
+            angle = torch.remainder(angle, math.pi)
+        else:
+            angle = torch.remainder(angle, 2.0 * math.pi)
+
+        diff = torch.abs(angle - self.bin_centers)
+        circular_diff = torch.minimum(diff, self.max_angle - diff)
+
+        bin_weights = F.relu(1.0 - circular_diff / (self.bin_width + self.eps))
+        votes = magnitude * bin_weights
+
+        cell_hist = F.avg_pool2d(
+            votes,
+            kernel_size=self.pixels_per_cell,
+            stride=self.pixels_per_cell,
+        )
+
+        cell_area = float(self.pixels_per_cell * self.pixels_per_cell)
+        cell_hist = cell_hist * cell_area
+
+        block = self.cells_per_block
+
+        if block > 1:
+            block_feats = F.unfold(
+                cell_hist,
+                kernel_size=block,
+                stride=1,
+            )
+
+            block_feats = block_feats / (
+                block_feats.pow(2).sum(dim=1, keepdim=True).sqrt() + self.eps
+            )
+
+            block_feats = torch.clamp(block_feats, max=0.2)
+
+            block_feats = block_feats / (
+                block_feats.pow(2).sum(dim=1, keepdim=True).sqrt() + self.eps
+            )
+
+            feats = block_feats.flatten(1)
+        else:
+            feats = cell_hist.flatten(1)
+
+        feats = F.normalize(feats, dim=1)
+        return feats
+
+
+class FrozenMultilevelResNet18Features(nn.Module):
+    def __init__(self, stages_per_level):
+        super().__init__()
+
+        try:
+            weights = models.ResNet18_Weights.DEFAULT
+            resnet = models.resnet18(weights=weights)
+        except Exception:
+            resnet = models.resnet18(pretrained=True)
+
+        self.stages_per_level = list(stages_per_level)
+
+        self.conv1 = resnet.conv1
+        self.bn1 = resnet.bn1
+        self.relu = resnet.relu
+        self.maxpool = resnet.maxpool
+
+        self.layer1 = resnet.layer1
+        self.layer2 = resnet.layer2
+        self.layer3 = resnet.layer3
+        self.layer4 = resnet.layer4
+
+        for p in self.parameters():
+            p.requires_grad = False
+
+        self.eval()
+
+        self.register_buffer(
+            "mean",
+            torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1),
+        )
+        self.register_buffer(
+            "std",
+            torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1),
+        )
+
+    def forward(self, x, level_idx):
+        stage = self.stages_per_level[level_idx]
+
+        x = rgb_01(x)
+        x = (x - self.mean) / self.std
+
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+
+        if stage == "stem":
+            pass
+        elif stage == "layer1":
+            x = self.maxpool(x)
+            x = self.layer1(x)
+        elif stage == "layer2":
+            x = self.maxpool(x)
+            x = self.layer1(x)
+            x = self.layer2(x)
+        elif stage == "layer3":
+            x = self.maxpool(x)
+            x = self.layer1(x)
+            x = self.layer2(x)
+            x = self.layer3(x)
+        elif stage == "layer4":
+            x = self.maxpool(x)
+            x = self.layer1(x)
+            x = self.layer2(x)
+            x = self.layer3(x)
+            x = self.layer4(x)
+        else:
+            raise ValueError(f"Unknown ResNet stage: {stage}")
+
+        x = F.adaptive_avg_pool2d(x, output_size=(1, 1))
+        x = x.flatten(1)
+        x = F.normalize(x, dim=1)
+        return x
+
+
+class FrozenVGG16EarlyFeatures(nn.Module):
+    def __init__(self, layer_cutoffs_by_level):
+        super().__init__()
+
+        try:
+            weights = models.VGG16_Weights.DEFAULT
+            vgg = models.vgg16(weights=weights)
+        except Exception:
+            vgg = models.vgg16(pretrained=True)
+
+        self.layer_cutoffs_by_level = list(layer_cutoffs_by_level)
+        max_cutoff = max(self.layer_cutoffs_by_level)
+        self.features = nn.Sequential(*list(vgg.features.children())[:max_cutoff])
+
+        for p in self.parameters():
+            p.requires_grad = False
+
+        self.eval()
+
+        self.register_buffer(
+            "mean",
+            torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1),
+        )
+        self.register_buffer(
+            "std",
+            torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1),
+        )
+
+    def forward(self, x, level_idx):
+        cutoff = self.layer_cutoffs_by_level[level_idx]
+        x = rgb_01(x)
+        x = (x - self.mean) / self.std
+
+        for i, layer in enumerate(self.features):
+            if i >= cutoff:
+                break
+            x = layer(x)
+
+        mean_pool = F.adaptive_avg_pool2d(x, output_size=(1, 1)).flatten(1)
+        max_pool = F.adaptive_max_pool2d(x, output_size=(1, 1)).flatten(1)
+        feats = torch.cat([mean_pool, max_pool], dim=1)
+        feats = F.normalize(feats, dim=1)
+        return feats
+
+
+class FrozenMobileNetV3SmallFeatures(nn.Module):
+    def __init__(self, cutoffs_by_level):
+        super().__init__()
+
+        try:
+            weights = models.MobileNet_V3_Small_Weights.DEFAULT
+            mobilenet = models.mobilenet_v3_small(weights=weights)
+        except Exception:
+            mobilenet = models.mobilenet_v3_small(pretrained=True)
+
+        self.cutoffs_by_level = list(cutoffs_by_level)
+        max_cutoff = max(self.cutoffs_by_level)
+        self.features = nn.Sequential(*list(mobilenet.features.children())[:max_cutoff])
+
+        for p in self.parameters():
+            p.requires_grad = False
+
+        self.eval()
+
+        self.register_buffer(
+            "mean",
+            torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1),
+        )
+        self.register_buffer(
+            "std",
+            torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1),
+        )
+
+    def forward(self, x, level_idx):
+        cutoff = self.cutoffs_by_level[level_idx]
+        x = rgb_01(x)
+        x = (x - self.mean) / self.std
+
+        for i, layer in enumerate(self.features):
+            if i >= cutoff:
+                break
+            x = layer(x)
+
+        mean_pool = F.adaptive_avg_pool2d(x, output_size=(1, 1)).flatten(1)
+        max_pool = F.adaptive_max_pool2d(x, output_size=(1, 1)).flatten(1)
+        feats = torch.cat([mean_pool, max_pool], dim=1)
+        feats = F.normalize(feats, dim=1)
+        return feats
+
+
+def make_gabor_kernel_bank(
+    num_orientations,
+    wavelengths,
+    kernel_size,
+    sigma,
+    gamma,
+    device,
+):
+    assert kernel_size % 2 == 1
+
+    radius = kernel_size // 2
+    coords = torch.arange(-radius, radius + 1, device=device).float()
+    yy, xx = torch.meshgrid(coords, coords, indexing="ij")
+
+    kernels = []
+
+    for wavelength in wavelengths:
+        for ori_idx in range(num_orientations):
+            theta = math.pi * float(ori_idx) / float(num_orientations)
+
+            x_theta = xx * math.cos(theta) + yy * math.sin(theta)
+            y_theta = -xx * math.sin(theta) + yy * math.cos(theta)
+
+            envelope = torch.exp(
+                -(x_theta.pow(2) + (gamma ** 2) * y_theta.pow(2))
+                / (2.0 * sigma ** 2)
+            )
+
+            carrier = torch.cos(2.0 * math.pi * x_theta / float(wavelength))
+
+            kernel = envelope * carrier
+            kernel = kernel - kernel.mean()
+            kernel = kernel / (kernel.norm() + 1e-8)
+
+            kernels.append(kernel)
+
+    bank = torch.stack(kernels, dim=0).view(len(kernels), 1, kernel_size, kernel_size)
+    return bank
+
+
+class FrozenGaborFeatures(nn.Module):
+    def __init__(
+        self,
+        num_orientations=8,
+        wavelengths=None,
+        kernel_size=11,
+        sigma=3.0,
+        gamma=0.5,
+        pooled_size=4,
+        use_abs_response=True,
+        eps=1e-6,
+    ):
+        super().__init__()
+
+        if wavelengths is None:
+            wavelengths = [4.0, 8.0, 16.0]
+
+        self.num_orientations = num_orientations
+        self.wavelengths = list(wavelengths)
+        self.kernel_size = kernel_size
+        self.sigma = sigma
+        self.gamma = gamma
+        self.pooled_size = pooled_size
+        self.use_abs_response = use_abs_response
+        self.eps = eps
+
+        self.register_buffer("gabor_bank", torch.empty(1))
+
+    def reset_filters(self, device):
+        self.gabor_bank = make_gabor_kernel_bank(
+            num_orientations=self.num_orientations,
+            wavelengths=self.wavelengths,
+            kernel_size=self.kernel_size,
+            sigma=self.sigma,
+            gamma=self.gamma,
+            device=device,
+        )
+
+    def forward(self, x):
+        gray = rgb_to_gray_01(x)
+
+        responses = F.conv2d(
+            gray,
+            self.gabor_bank,
+            padding=self.kernel_size // 2,
+        )
+
+        if self.use_abs_response:
+            responses = responses.abs()
+
+        pooled = F.adaptive_avg_pool2d(
+            responses,
+            output_size=(self.pooled_size, self.pooled_size),
+        )
+
+        feats = pooled.flatten(1)
+        feats = F.normalize(feats, dim=1)
+        return feats
+
+
+class FrozenDoGBlobFeatures(nn.Module):
+    def __init__(
+        self,
+        sigmas=None,
+        kernel_size=9,
+        pooled_size=4,
+        include_signed=True,
+        eps=1e-6,
+    ):
+        super().__init__()
+
+        if sigmas is None:
+            sigmas = [0.7, 1.2, 2.0, 3.2]
+
+        assert len(sigmas) >= 2
+
+        self.sigmas = list(sigmas)
+        self.kernel_size = kernel_size
+        self.pooled_size = pooled_size
+        self.include_signed = include_signed
+        self.eps = eps
+
+    def forward(self, x):
+        gray = rgb_to_gray_01(x)
+
+        blurred = [
+            gaussian_blur(
+                gray,
+                kernel_size=self.kernel_size,
+                sigma=float(sigma),
+            )
+            for sigma in self.sigmas
+        ]
+
+        dog_maps = []
+
+        for i in range(len(blurred) - 1):
+            dog = blurred[i + 1] - blurred[i]
+            dog_maps.append(dog.abs())
+
+            if self.include_signed:
+                dog_maps.append(dog)
+
+        maps = torch.cat(dog_maps, dim=1)
+
+        pooled = F.adaptive_avg_pool2d(
+            maps,
+            output_size=(self.pooled_size, self.pooled_size),
+        )
+
+        feats = pooled.flatten(1)
+        feats = F.normalize(feats, dim=1)
+        return feats
+
+
+class FrozenFFTSpectrumFeatures(nn.Module):
+    def __init__(
+        self,
+        image_size=64,
+        radial_bins=6,
+        orientation_bins=8,
+        use_log_magnitude=True,
+        eps=1e-6,
+    ):
+        super().__init__()
+
+        self.image_size = image_size
+        self.radial_bins = radial_bins
+        self.orientation_bins = orientation_bins
+        self.use_log_magnitude = use_log_magnitude
+        self.eps = eps
+
+        self.register_buffer("radial_masks", torch.empty(1))
+        self.register_buffer("orientation_masks", torch.empty(1))
+        self.register_buffer("hann2d", torch.empty(1))
+
+    def reset_masks(self, device):
+        H = self.image_size
+        W = self.image_size
+
+        fy = torch.fft.fftfreq(H, device=device).view(H, 1)
+        fx = torch.fft.rfftfreq(W, device=device).view(1, W // 2 + 1)
+
+        rr = torch.sqrt(fx.pow(2) + fy.pow(2))
+        rr_max = rr.max().clamp_min(self.eps)
+
+        theta = torch.atan2(fy, fx + self.eps)
+        theta = torch.remainder(theta, math.pi)
+
+        radial_edges = torch.linspace(
+            0.0,
+            float(rr_max.item()),
+            steps=self.radial_bins + 1,
+            device=device,
+        )
+
+        radial_masks = []
+
+        for i in range(self.radial_bins):
+            lo = radial_edges[i]
+            hi = radial_edges[i + 1]
+
+            if i == 0:
+                mask = (rr >= lo) & (rr <= hi)
+            else:
+                mask = (rr > lo) & (rr <= hi)
+
+            radial_masks.append(mask.float())
+
+        radial_masks = torch.stack(radial_masks, dim=0)
+
+        orientation_edges = torch.linspace(
+            0.0,
+            math.pi,
+            steps=self.orientation_bins + 1,
+            device=device,
+        )
+
+        orientation_masks = []
+
+        for i in range(self.orientation_bins):
+            lo = orientation_edges[i]
+            hi = orientation_edges[i + 1]
+
+            if i == 0:
+                mask = (theta >= lo) & (theta <= hi)
+            else:
+                mask = (theta > lo) & (theta <= hi)
+
+            mask = mask & (rr > 0.0)
+            orientation_masks.append(mask.float())
+
+        orientation_masks = torch.stack(orientation_masks, dim=0)
+
+        hann_y = torch.hann_window(H, device=device).view(1, 1, H, 1)
+        hann_x = torch.hann_window(W, device=device).view(1, 1, 1, W)
+        hann2d = hann_y * hann_x
+
+        self.radial_masks = radial_masks
+        self.orientation_masks = orientation_masks
+        self.hann2d = hann2d
+
+    def _masked_mean(self, magnitude, masks):
+        numerator = (magnitude.unsqueeze(1) * masks.unsqueeze(0)).sum(dim=(2, 3))
+        denominator = masks.sum(dim=(1, 2)).clamp_min(self.eps).view(1, -1)
+        return numerator / denominator
+
+    def forward(self, x):
+        gray = rgb_to_gray_01(x)
+
+        gray = gray - gray.mean(dim=(2, 3), keepdim=True)
+        gray = gray * self.hann2d
+
+        fft = torch.fft.rfft2(gray.squeeze(1), norm="ortho")
+        magnitude = fft.abs()
+
+        if self.use_log_magnitude:
+            magnitude = torch.log1p(magnitude)
+
+        radial_feats = self._masked_mean(
+            magnitude=magnitude,
+            masks=self.radial_masks,
+        )
+
+        orientation_feats = self._masked_mean(
+            magnitude=magnitude,
+            masks=self.orientation_masks,
+        )
+
+        feats = torch.cat(
+            [
+                radial_feats,
+                orientation_feats,
+            ],
+            dim=1,
+        )
+
+        feats = F.normalize(feats, dim=1)
+        return feats
+
+
+class FrozenSteerableGradientFeatures(nn.Module):
+    def __init__(
+        self,
+        num_orientations=12,
+        blur_kernel_size=5,
+        blur_sigma=1.0,
+        pooled_size=4,
+        include_signed=True,
+        eps=1e-6,
+    ):
+        super().__init__()
+
+        self.num_orientations = num_orientations
+        self.blur_kernel_size = blur_kernel_size
+        self.blur_sigma = blur_sigma
+        self.pooled_size = pooled_size
+        self.include_signed = include_signed
+        self.eps = eps
+
+        gx = torch.tensor(
+            [[-1, 0, 1],
+             [-2, 0, 2],
+             [-1, 0, 1]],
+            dtype=torch.float32,
+        ).view(1, 1, 3, 3)
+
+        gy = torch.tensor(
+            [[-1, -2, -1],
+             [ 0,  0,  0],
+             [ 1,  2,  1]],
+            dtype=torch.float32,
+        ).view(1, 1, 3, 3)
+
+        self.register_buffer("sobel_x", gx)
+        self.register_buffer("sobel_y", gy)
+
+        angles = torch.linspace(
+            0.0,
+            math.pi,
+            steps=num_orientations + 1,
+            dtype=torch.float32,
+        )[:-1]
+        self.register_buffer("angles", angles)
+
+    def forward(self, x):
+        gray = rgb_to_gray_01(x)
+        gray = gaussian_blur(gray, kernel_size=self.blur_kernel_size, sigma=self.blur_sigma)
+
+        gx = F.conv2d(gray, self.sobel_x, padding=1)
+        gy = F.conv2d(gray, self.sobel_y, padding=1)
+
+        responses = []
+        for theta in self.angles:
+            resp = math.cos(float(theta.item())) * gx + math.sin(float(theta.item())) * gy
+            responses.append(resp.abs())
+            if self.include_signed:
+                responses.append(resp)
+
+        maps = torch.cat(responses, dim=1)
+        pooled = F.adaptive_avg_pool2d(maps, output_size=(self.pooled_size, self.pooled_size))
+        feats = pooled.flatten(1)
+        feats = F.normalize(feats, dim=1)
+        return feats
+
+
+class FrozenHSVColorFeatures(nn.Module):
+    def __init__(
+        self,
+        h_bins=12,
+        s_bins=6,
+        v_bins=6,
+        pooled_size=4,
+        eps=1e-6,
+    ):
+        super().__init__()
+
+        self.h_bins = h_bins
+        self.s_bins = s_bins
+        self.v_bins = v_bins
+        self.pooled_size = pooled_size
+        self.eps = eps
+
+    def forward(self, x):
+        rgb = rgb_01(x)
+        hsv = rgb_to_hsv_01(x, eps=self.eps)
+
+        h = hsv[:, 0:1]
+        s = hsv[:, 1:2]
+        v = hsv[:, 2:3]
+
+        h_hist = soft_histogram_01(h, bins=self.h_bins, eps=self.eps)
+        s_hist = soft_histogram_01(s, bins=self.s_bins, eps=self.eps)
+        v_hist = soft_histogram_01(v, bins=self.v_bins, eps=self.eps)
+
+        rgb_mean = rgb.mean(dim=(2, 3))
+        rgb_std = rgb.std(dim=(2, 3), unbiased=False)
+        hsv_mean = hsv.mean(dim=(2, 3))
+        hsv_std = hsv.std(dim=(2, 3), unbiased=False)
+
+        pooled_hsv = F.adaptive_avg_pool2d(hsv, output_size=(self.pooled_size, self.pooled_size)).flatten(1)
+
+        feats = torch.cat(
+            [
+                h_hist,
+                s_hist,
+                v_hist,
+                rgb_mean,
+                rgb_std,
+                hsv_mean,
+                hsv_std,
+                pooled_hsv,
+            ],
+            dim=1,
+        )
+        feats = F.normalize(feats, dim=1)
+        return feats
+
+
+class FrozenSoftLBPFeatures(nn.Module):
+    def __init__(
+        self,
+        sharpness=12.0,
+        pooled_size=4,
+        include_code_stats=True,
+        eps=1e-6,
+    ):
+        super().__init__()
+
+        self.sharpness = sharpness
+        self.pooled_size = pooled_size
+        self.include_code_stats = include_code_stats
+        self.eps = eps
+
+        weights = torch.tensor([1, 2, 4, 8, 16, 32, 64, 128], dtype=torch.float32)
+        self.register_buffer("bit_weights", weights.view(1, 8, 1, 1) / 255.0)
+
+    def forward(self, x):
+        gray = rgb_to_gray_01(x)
+
+        padded = F.pad(gray, pad=(1, 1, 1, 1), mode="reflect")
+        center = padded[:, :, 1:-1, 1:-1]
+
+        neighbors = [
+            padded[:, :, 0:-2, 0:-2],
+            padded[:, :, 0:-2, 1:-1],
+            padded[:, :, 0:-2, 2:  ],
+            padded[:, :, 1:-1, 2:  ],
+            padded[:, :, 2:  , 2:  ],
+            padded[:, :, 2:  , 1:-1],
+            padded[:, :, 2:  , 0:-2],
+            padded[:, :, 1:-1, 0:-2],
+        ]
+
+        soft_bits = [torch.sigmoid(self.sharpness * (n - center)) for n in neighbors]
+        bits = torch.cat(soft_bits, dim=1)
+
+        code = (bits * self.bit_weights).sum(dim=1, keepdim=True)
+
+        pooled_bits = F.adaptive_avg_pool2d(bits, output_size=(self.pooled_size, self.pooled_size)).flatten(1)
+        pooled_code = F.adaptive_avg_pool2d(code, output_size=(self.pooled_size, self.pooled_size)).flatten(1)
+
+        feats = [pooled_bits, pooled_code]
+
+        if self.include_code_stats:
+            feats.extend([
+                bits.mean(dim=(2, 3)),
+                bits.std(dim=(2, 3), unbiased=False),
+                code.mean(dim=(2, 3)),
+                code.std(dim=(2, 3), unbiased=False),
+            ])
+
+        feats = torch.cat(feats, dim=1)
+        feats = F.normalize(feats, dim=1)
+        return feats
+
+
+class FrozenShapeEdgeFeatures(nn.Module):
+    def __init__(
+        self,
+        orientation_bins=12,
+        pooled_size=4,
+        blur_kernel_size=3,
+        blur_sigma=0.6,
+        eps=1e-6,
+    ):
+        super().__init__()
+
+        self.orientation_bins = orientation_bins
+        self.pooled_size = pooled_size
+        self.blur_kernel_size = blur_kernel_size
+        self.blur_sigma = blur_sigma
+        self.eps = eps
+
+        gx = torch.tensor(
+            [[-1, 0, 1],
+             [-2, 0, 2],
+             [-1, 0, 1]],
+            dtype=torch.float32,
+        ).view(1, 1, 3, 3)
+
+        gy = torch.tensor(
+            [[-1, -2, -1],
+             [ 0,  0,  0],
+             [ 1,  2,  1]],
+            dtype=torch.float32,
+        ).view(1, 1, 3, 3)
+
+        lap = torch.tensor(
+            [[0,  1, 0],
+             [1, -4, 1],
+             [0,  1, 0]],
+            dtype=torch.float32,
+        ).view(1, 1, 3, 3)
+
+        self.register_buffer("sobel_x", gx)
+        self.register_buffer("sobel_y", gy)
+        self.register_buffer("laplacian", lap)
+
+        centers = torch.linspace(0.0, math.pi, steps=orientation_bins + 1, dtype=torch.float32)[:-1]
+        self.register_buffer("bin_centers", centers.view(1, orientation_bins, 1, 1))
+        self.bin_width = math.pi / float(orientation_bins)
+
+    def forward(self, x):
+        gray = rgb_to_gray_01(x)
+        gray = gaussian_blur(gray, kernel_size=self.blur_kernel_size, sigma=self.blur_sigma)
+
+        gx = F.conv2d(gray, self.sobel_x, padding=1)
+        gy = F.conv2d(gray, self.sobel_y, padding=1)
+        lap = F.conv2d(gray, self.laplacian, padding=1)
+
+        edge_mag = torch.sqrt(gx.pow(2) + gy.pow(2) + self.eps)
+        angle = torch.remainder(torch.atan2(gy, gx), math.pi)
+
+        diff = torch.abs(angle - self.bin_centers)
+        circular_diff = torch.minimum(diff, math.pi - diff)
+        ori_weights = F.relu(1.0 - circular_diff / (self.bin_width + self.eps))
+        ori_votes = edge_mag * ori_weights
+
+        # Structure-tensor style shape cues.
+        jxx = gaussian_blur(gx * gx, kernel_size=3, sigma=0.6)
+        jyy = gaussian_blur(gy * gy, kernel_size=3, sigma=0.6)
+        jxy = gaussian_blur(gx * gy, kernel_size=3, sigma=0.6)
+        coherence = torch.sqrt((jxx - jyy).pow(2) + 4.0 * jxy.pow(2) + self.eps) / (jxx + jyy + self.eps)
+
+        pooled_ori = F.adaptive_avg_pool2d(ori_votes, output_size=(self.pooled_size, self.pooled_size)).flatten(1)
+        pooled_maps = F.adaptive_avg_pool2d(
+            torch.cat([edge_mag, lap.abs(), lap, coherence], dim=1),
+            output_size=(self.pooled_size, self.pooled_size),
+        ).flatten(1)
+
+        global_stats = torch.cat(
+            [
+                edge_mag.mean(dim=(2, 3)),
+                edge_mag.std(dim=(2, 3), unbiased=False),
+                lap.abs().mean(dim=(2, 3)),
+                coherence.mean(dim=(2, 3)),
+            ],
+            dim=1,
+        )
+
+        feats = torch.cat([pooled_ori, pooled_maps, global_stats], dim=1)
+        feats = F.normalize(feats, dim=1)
+        return feats
+
+
+# ============================================================
+# Similarities and losses
+# ============================================================
+
+def cosine_similarity_matrix(x):
+    x = F.normalize(x, dim=1)
+    return x @ x.T
+
+
+def relational_loss_from_similarities(sim_img, sim_y):
+    B = sim_img.shape[0]
+    mask = ~torch.eye(B, dtype=torch.bool, device=sim_img.device)
+
+    return F.mse_loss(
+        sim_img[mask],
+        sim_y[mask],
+    )
+
+
+def relative_diversity_ceiling(sim_y):
+    """
+    Converts target cosine similarity into a pairwise image-similarity ceiling.
+
+        ceiling = 1 - strength * (1 - sim_y)
+
+    Examples:
+        strength = 1.0:
+            sim_y  1 -> ceiling  1
+            sim_y  0 -> ceiling  0
+            sim_y -1 -> ceiling -1
+
+        strength = 0.5:
+            sim_y  1 -> ceiling  1
+            sim_y  0 -> ceiling  0.5
+            sim_y -1 -> ceiling  0
+    """
+    strength = float(PATTERN_DIVERSITY_STRENGTH)
+
+    if strength < 0.0 or strength > 1.0:
+        raise ValueError(
+            f"PATTERN_DIVERSITY_STRENGTH must be in [0, 1], got {strength}."
+        )
+
+    ceiling = 1.0 - strength * (1.0 - sim_y)
+    ceiling = torch.clamp(ceiling, min=-1.0, max=1.0)
+    return ceiling
+
+
+def pattern_diversity_penalty(sim_img, sim_y):
+    B = sim_img.shape[0]
+    off_diag_mask = ~torch.eye(B, dtype=torch.bool, device=sim_img.device)
+
+    ceiling = relative_diversity_ceiling(sim_y)
+
+    offending_amount = F.relu(sim_img - ceiling)
+    loss = offending_amount[off_diag_mask].pow(2).mean()
+
+    return loss
+
+def extract_features_for_branch_scale(
+        x_level,
+        feature_family_name,
+        level_idx,
+        hog_features_by_level,
+        resnet_features,
+        gabor_features_by_level,
+        dog_features_by_level,
+        fft_features_by_level,
+        steerable_features_by_level,
+        vgg_features,
+        mobilenet_features,
+        color_features_by_level,
+        soft_lbp_features_by_level,
+        shape_features_by_level,
+        soft_contour_features_by_level,
+        curvature_hessian_features_by_level,
+):
+    if feature_family_name == "hog":
+        feats = hog_features_by_level[level_idx](x_level)
+        feature_desc = "HOG"
+
+    elif feature_family_name == "resnet18":
+        feats = resnet_features(x_level, level_idx=level_idx)
+        feature_desc = f"ResNet18-{RESNET_STAGES_PER_LEVEL[level_idx]}"
+
+    elif feature_family_name == "gabor":
+        feats = gabor_features_by_level[level_idx](x_level)
+        feature_desc = "Gabor"
+
+    elif feature_family_name == "dog":
+        feats = dog_features_by_level[level_idx](x_level)
+        feature_desc = "DoG/blob"
+
+    elif feature_family_name == "fft":
+        feats = fft_features_by_level[level_idx](x_level)
+        feature_desc = "FFT spectrum"
+
+    elif feature_family_name == "steerable":
+        feats = steerable_features_by_level[level_idx](x_level)
+        feature_desc = "Steerable gradients"
+
+    elif feature_family_name == "vgg16_early":
+        feats = vgg_features(x_level, level_idx=level_idx)
+        feature_desc = f"VGG16-early-{VGG_LAYER_CUTOFF_BY_LEVEL[level_idx]}"
+
+    elif feature_family_name == "mobilenet_v3_small":
+        feats = mobilenet_features(x_level, level_idx=level_idx)
+        feature_desc = f"MobileNetV3S-{MOBILENET_FEATURE_CUTOFF_BY_LEVEL[level_idx]}"
+
+    elif feature_family_name == "color_hsv":
+        feats = color_features_by_level[level_idx](x_level)
+        feature_desc = "HSV/color"
+
+    elif feature_family_name == "soft_lbp":
+        feats = soft_lbp_features_by_level[level_idx](x_level)
+        feature_desc = "Soft LBP"
+
+    elif feature_family_name == "shape_edges":
+        feats = shape_features_by_level[level_idx](x_level)
+        feature_desc = "Shape/edges"
+    elif feature_family_name == "soft_contour":
+        feats = soft_contour_features_by_level[level_idx](x_level)
+        feature_desc = "Soft contour"
+
+    elif feature_family_name == "curvature_hessian":
+        feats = curvature_hessian_features_by_level[level_idx](x_level)
+        feature_desc = "Curvature/Hessian"
+
+    else:
+        raise ValueError(f"Unknown feature family: {feature_family_name}")
+
+    return feats, feature_desc
+
+
+def compute_isolated_branch_losses(
+    generator,
+    frozen_prior_generator,
+    z,
+    base_vector_chunk,
+    hog_features_by_level,
+    resnet_features,
+    gabor_features_by_level,
+    dog_features_by_level,
+    fft_features_by_level,
+    steerable_features_by_level,
+    vgg_features,
+    mobilenet_features,
+    color_features_by_level,
+    soft_lbp_features_by_level,
+    shape_features_by_level,
+    soft_contour_features_by_level,
+    curvature_hessian_features_by_level,
+):
+    """
+    Main training logic.
+
+    For each branch/scale:
+        - create isolated y with only that 2D chunk active
+        - generate isolated image
+        - compute this branch/scale's feature loss on that isolated image
+        - compute branch-local diversity using only that 2D cosine target
+        - compute branch-local style prior against frozen prior generator
+    """
+    total_rel_loss = 0.0
+    total_pattern_div_loss = 0.0
+    total_prior_loss = 0.0
+
+    logs = []
+
+    composite_imgs = None
+    total_composite_weight = 0.0
+
+    sim_y = vector_cosine_similarity_matrix(base_vector_chunk)
+
+    for feature_family_idx, feature_family_name in enumerate(FEATURE_FAMILIES):
+        feature_weight = float(FEATURE_FAMILY_LOSS_WEIGHTS[feature_family_name])
+
+        for level_idx in range(NUM_SCALES):
+            level_weight = float(LEVEL_LOSS_WEIGHTS[level_idx])
+            combined_weight = feature_weight * level_weight
+
+            y_isolated = make_isolated_feature_level_vector(
+                vector_chunk=base_vector_chunk,
+                feature_family_idx=feature_family_idx,
+                level_idx=level_idx,
+            )
+
+            imgs_isolated = generator(z, y_isolated)
+
+            with torch.no_grad():
+                prior_imgs_isolated = frozen_prior_generator(z, y_isolated)
+
+            prior_loss_l = F.mse_loss(
+                imgs_isolated,
+                prior_imgs_isolated,
+            )
+
+            pyramid = build_image_pyramid(imgs_isolated)
+            x_level = pyramid[level_idx]
+
+            feats, feature_desc = extract_features_for_branch_scale(
+                x_level=x_level,
+                feature_family_name=feature_family_name,
+                level_idx=level_idx,
+                hog_features_by_level=hog_features_by_level,
+                resnet_features=resnet_features,
+                gabor_features_by_level=gabor_features_by_level,
+                dog_features_by_level=dog_features_by_level,
+                fft_features_by_level=fft_features_by_level,
+                steerable_features_by_level=steerable_features_by_level,
+                vgg_features=vgg_features,
+                mobilenet_features=mobilenet_features,
+                color_features_by_level=color_features_by_level,
+                soft_lbp_features_by_level=soft_lbp_features_by_level,
+                shape_features_by_level=shape_features_by_level,
+                soft_contour_features_by_level=soft_contour_features_by_level,
+                curvature_hessian_features_by_level=curvature_hessian_features_by_level,
+            )
+
+            sim_img = cosine_similarity_matrix(feats)
+
+            rel_loss_l = relational_loss_from_similarities(
+                sim_img=sim_img,
+                sim_y=sim_y,
+            )
+
+            pattern_div_loss_l = pattern_diversity_penalty(
+                sim_img=sim_img,
+                sim_y=sim_y,
+            )
+
+            total_rel_loss = total_rel_loss + combined_weight * rel_loss_l
+            total_pattern_div_loss = total_pattern_div_loss + combined_weight * pattern_div_loss_l
+            total_prior_loss = total_prior_loss + combined_weight * prior_loss_l
+
+            if composite_imgs is None:
+                composite_imgs = combined_weight * imgs_isolated
+            else:
+                composite_imgs = composite_imgs + combined_weight * imgs_isolated
+
+            total_composite_weight += combined_weight
+
+            with torch.no_grad():
+                ceiling = relative_diversity_ceiling(sim_y)
+                off_diag_mask = ~torch.eye(
+                    sim_img.shape[0],
+                    dtype=torch.bool,
+                    device=sim_img.device,
+                )
+
+                avg_img_sim = float(sim_img[off_diag_mask].mean().item())
+                avg_vec_sim = float(sim_y[off_diag_mask].mean().item())
+                avg_div_ceiling = float(ceiling[off_diag_mask].mean().item())
+
+            logs.append({
+                "feature_family_idx": feature_family_idx,
+                "feature_family": feature_family_name,
+                "feature_desc": feature_desc,
+                "feature_weight": feature_weight,
+
+                "level_idx": level_idx,
+                "resolution": RESOLUTION_LEVELS[level_idx],
+                "downsample_steps": DOWNSAMPLE_STEPS_PER_LEVEL[level_idx],
+                "level_weight": level_weight,
+
+                "combined_weight": combined_weight,
+                "rel_loss": float(rel_loss_l.item()),
+                "pattern_diversity_penalty": float(pattern_div_loss_l.item()),
+                "prior_loss": float(prior_loss_l.item()),
+                "avg_img_sim": avg_img_sim,
+                "avg_vector_sim": avg_vec_sim,
+                "avg_diversity_ceiling": avg_div_ceiling,
+                "sim_img": sim_img.detach(),
+                "sim_y": sim_y.detach(),
+            })
+
+    if total_composite_weight > 0:
+        composite_imgs = composite_imgs / float(total_composite_weight)
+
+    return total_rel_loss, total_pattern_div_loss, total_prior_loss, composite_imgs, logs
+
+
+# ============================================================
+# Training step
+# ============================================================
+
+def train_step(
+    generator,
+    frozen_prior_generator,
+    hog_features_by_level,
+    resnet_features,
+    gabor_features_by_level,
+    dog_features_by_level,
+    fft_features_by_level,
+    steerable_features_by_level,
+    vgg_features,
+    mobilenet_features,
+    color_features_by_level,
+    soft_lbp_features_by_level,
+    shape_features_by_level,
+    soft_contour_features_by_level,
+    curvature_hessian_features_by_level,
+    optimizer,
+    batch_size,
+    z_dim,
+    device,
+):
+    generator.train()
+    frozen_prior_generator.eval()
+
+    for module_list in [
+        hog_features_by_level,
+        gabor_features_by_level,
+        dog_features_by_level,
+        fft_features_by_level,
+        steerable_features_by_level,
+        color_features_by_level,
+        soft_lbp_features_by_level,
+        shape_features_by_level,
+        soft_contour_features_by_level,
+        curvature_hessian_features_by_level,
+
+    ]:
+        for module in module_list:
+            module.eval()
+
+    resnet_features.eval()
+    vgg_features.eval()
+    mobilenet_features.eval()
+
+    z = torch.randn(batch_size, z_dim, device=device)
+
+    # One 2D chunk per image. This chunk is activated one branch/scale at a time.
+    base_vector_chunk = sample_training_vector_chunk(
+        batch_size=batch_size,
+        device=device,
+    )
+
+    rel_loss, pattern_div_penalty, prior_loss, composite_imgs, logs = compute_isolated_branch_losses(
+        generator=generator,
+        frozen_prior_generator=frozen_prior_generator,
+        z=z,
+        base_vector_chunk=base_vector_chunk,
+        hog_features_by_level=hog_features_by_level,
+        resnet_features=resnet_features,
+        gabor_features_by_level=gabor_features_by_level,
+        dog_features_by_level=dog_features_by_level,
+        fft_features_by_level=fft_features_by_level,
+        steerable_features_by_level=steerable_features_by_level,
+        vgg_features=vgg_features,
+        mobilenet_features=mobilenet_features,
+        color_features_by_level=color_features_by_level,
+        soft_lbp_features_by_level=soft_lbp_features_by_level,
+        shape_features_by_level=shape_features_by_level,
+        soft_contour_features_by_level=soft_contour_features_by_level,
+        curvature_hessian_features_by_level=curvature_hessian_features_by_level,
+    )
+
+    total_loss = (
+        RELATIONAL_LOSS_WEIGHT * rel_loss
+        + PATTERN_DIVERSITY_WEIGHT * pattern_div_penalty
+        + STYLE_PRIOR_WEIGHT * prior_loss
+    )
+
+    optimizer.zero_grad(set_to_none=True)
+    total_loss.backward()
+    optimizer.step()
+
+    return {
+        "total_loss": float(total_loss.item()),
+        "rel_loss": float(rel_loss.item()),
+        "pattern_diversity_penalty": float(pattern_div_penalty.item()),
+        "prior_loss": float(prior_loss.item()),
+        "imgs": composite_imgs.detach(),
+        "base_vector_chunk": base_vector_chunk.detach(),
+        "logs": logs,
+    }
+
+
+# ============================================================
+# Visualization / checkpoint saving
+# ============================================================
+
+def image_for_visual_level(imgs, level_idx):
+    """
+    L0: show normal 64x64 image.
+    L1: show 16x16 downsampled image, nearest-upsampled to 64x64.
+    """
+    pyramid = build_image_pyramid(imgs)
+    x = pyramid[level_idx]
+
+    if x.shape[-1] != IMAGE_SIZE:
+        x = F.interpolate(
+            x,
+            size=(IMAGE_SIZE, IMAGE_SIZE),
+            mode="nearest",
+        )
+
+    return x
+
+
+def feature_label_for_row(feature_family, level_idx):
+    if feature_family == "hog":
+        return "HOG"
+    if feature_family == "resnet18":
+        return f"ResNet18\n{RESNET_STAGES_PER_LEVEL[level_idx]}"
+    if feature_family == "gabor":
+        return "Gabor"
+    if feature_family == "dog":
+        return "DoG/blob"
+    if feature_family == "fft":
+        return "FFT\nspectrum"
+    if feature_family == "steerable":
+        return "Steerable\ngrad"
+    if feature_family == "vgg16_early":
+        return f"VGG16\nearly {VGG_LAYER_CUTOFF_BY_LEVEL[level_idx]}"
+    if feature_family == "mobilenet_v3_small":
+        return f"MobileNet\nV3S {MOBILENET_FEATURE_CUTOFF_BY_LEVEL[level_idx]}"
+    if feature_family == "color_hsv":
+        return "HSV/color"
+    if feature_family == "soft_lbp":
+        return "Soft LBP"
+    if feature_family == "shape_edges":
+        return "Shape\nedges"
+    if feature_family == "soft_contour":
+        return "Soft\ncontour"
+    if feature_family == "curvature_hessian":
+        return "Curvature\nHessian"
+    return feature_family
+
+def make_branch_scale_similarity_grid(
+    generator,
+    z_dim,
+    device,
+    title="Generated images: rows=branch/scale, columns=target 3D cosine similarity",
+    save_path=None,
+):
+    """
+    Makes a 26 x 18 grid.
+
+    Rows:
+        13 feature families * 2 scales
+
+    For each row:
+        - the full VECTOR_DIM vector is zero
+        - only the row's branch/scale 3D chunk is active
+        - one fixed z is used across that row
+        - lower-scale rows are displayed at that lower scale, nearest-upsampled
+    """
+    generator.eval()
+
+    chosen_centered, chosen_raw, chosen_actual_sim = choose_3d_vectors_for_target_similarities(
+        device=device,
+    )
+
+    rows = NUM_FEATURE_FAMILIES * NUM_SCALES
+    cols = len(VIS_TARGET_SIMILARITIES)
+
+    all_y = []
+    all_z = []
+    labels = []
+
+    z_by_row = [
+        torch.randn(1, z_dim, device=device)
+        for _ in range(rows)
+    ]
+
+    row_idx = 0
+
+    for feature_family_idx, feature_family_name in enumerate(FEATURE_FAMILIES):
+        for level_idx in range(NUM_SCALES):
+            for col_idx in range(cols):
+                vector_chunk = chosen_centered[col_idx].view(1, DIMS_PER_VECTOR)
+
+                y = make_isolated_feature_level_vector(
+                    vector_chunk=vector_chunk,
+                    feature_family_idx=feature_family_idx,
+                    level_idx=level_idx,
+                )
+
+                z = z_by_row[row_idx].clone()
+
+                all_y.append(y)
+                all_z.append(z)
+
+                raw_triplet = chosen_raw[col_idx].detach().cpu().view(-1).tolist()
+                centered_triplet = chosen_centered[col_idx].detach().cpu().view(-1).tolist()
+
+                labels.append({
+                    "row_idx": row_idx,
+                    "feature_family_idx": feature_family_idx,
+                    "feature_family": feature_family_name,
+                    "level_idx": level_idx,
+                    "resolution": RESOLUTION_LEVELS[level_idx],
+                    "target_sim": VIS_TARGET_SIMILARITIES[col_idx],
+                    "actual_sim": float(chosen_actual_sim[col_idx].detach().cpu().item()),
+                    "raw_triplet": [
+                        int(raw_triplet[0]),
+                        int(raw_triplet[1]),
+                        int(raw_triplet[2]),
+                    ],
+                    "centered_triplet": [
+                        float(centered_triplet[0]),
+                        float(centered_triplet[1]),
+                        float(centered_triplet[2]),
+                    ],
+                })
+
+            row_idx += 1
+
+    y = torch.cat(all_y, dim=0)
+    z = torch.cat(all_z, dim=0)
+
+    with torch.no_grad():
+        imgs = generator(z, y)
+
+        imgs_display = []
+
+        for row_idx in range(rows):
+            start = row_idx * cols
+            end = start + cols
+
+            row_labels = labels[start:end]
+            level_idx = row_labels[0]["level_idx"]
+
+            imgs_row = imgs[start:end]
+            imgs_row_vis = image_for_visual_level(
+                imgs_row,
+                level_idx=level_idx,
+            )
+
+            imgs_display.append(imgs_row_vis)
+
+        imgs_display = torch.cat(imgs_display, dim=0)
+
+    imgs_vis = (imgs_display.clamp(-1, 1) + 1.0) / 2.0
+    imgs_vis = imgs_vis.detach().cpu()
+
+    fig = plt.figure(figsize=(cols * 1.45, rows * 1.75))
+    fig.suptitle(title, fontsize=14)
+
+    for idx, label in enumerate(labels):
+        row = label["row_idx"]
+        col = idx % cols
+        plot_idx = row * cols + col + 1
+
+        img = imgs_vis[idx].permute(1, 2, 0).numpy()
+
+        ax = plt.subplot(rows, cols, plot_idx)
+        ax.imshow(img)
+        ax.axis("off")
+
+        if row == 0:
+            rt = label["raw_triplet"]
+            ax.set_title(
+                f"cos {label['actual_sim']:+.3f}\n"
+                f"raw=({rt[0]},{rt[1]},{rt[2]})",
+                fontsize=6,
+            )
+
+        if col == 0:
+            feature_desc = feature_label_for_row(label["feature_family"], label["level_idx"])
+            resolution = label["resolution"]
+
+            ax.set_ylabel(
+                f"{feature_desc}\n"
+                f"L{label['level_idx']}\n"
+                f"{resolution}x{resolution}",
+                fontsize=7,
+                rotation=0,
+                labelpad=42,
+                va="center",
+            )
+
+    plt.tight_layout()
+
+    if save_path is not None:
+        save_dir = os.path.dirname(save_path)
+        if save_dir:
+            os.makedirs(save_dir, exist_ok=True)
+
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"Saved sample visualization: {save_path}")
+    else:
+        plt.show()
+def checkpoint_payload(generator, optimizer, step):
+    return {
+        "generator_state_dict": generator.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "step": step,
+
+        "z_dim": Z_DIM,
+        "vector_dim": VECTOR_DIM,
+        "image_size": IMAGE_SIZE,
+        "base_channels": BASE_CHANNELS,
+
+        "num_scales": NUM_SCALES,
+        "resolution_levels": RESOLUTION_LEVELS,
+        "downsample_steps_per_level": DOWNSAMPLE_STEPS_PER_LEVEL,
+        "level_loss_weights": LEVEL_LOSS_WEIGHTS,
+
+        "feature_families": FEATURE_FAMILIES,
+        "feature_family_loss_weights": FEATURE_FAMILY_LOSS_WEIGHTS,
+
+        "resnet_stages_per_level": RESNET_STAGES_PER_LEVEL,
+        "vgg_layer_cutoff_by_level": VGG_LAYER_CUTOFF_BY_LEVEL,
+        "mobilenet_feature_cutoff_by_level": MOBILENET_FEATURE_CUTOFF_BY_LEVEL,
+
+        "hog_orientations_by_level": HOG_ORIENTATIONS_BY_LEVEL,
+        "hog_pixels_per_cell_by_level": HOG_PIXELS_PER_CELL_BY_LEVEL,
+        "hog_cells_per_block_by_level": HOG_CELLS_PER_BLOCK_BY_LEVEL,
+        "hog_blur_kernel_size_by_level": HOG_BLUR_KERNEL_SIZE_BY_LEVEL,
+        "hog_blur_sigma_by_level": HOG_BLUR_SIGMA_BY_LEVEL,
+        "hog_use_unsigned_orientation_by_level": HOG_USE_UNSIGNED_ORIENTATION_BY_LEVEL,
+        "hog_gamma_correction_by_level": HOG_GAMMA_CORRECTION_BY_LEVEL,
+
+        "gabor_num_orientations_by_level": GABOR_NUM_ORIENTATIONS_BY_LEVEL,
+        "gabor_wavelengths_by_level": GABOR_WAVELENGTHS_BY_LEVEL,
+        "gabor_kernel_size_by_level": GABOR_KERNEL_SIZE_BY_LEVEL,
+        "gabor_sigma_by_level": GABOR_SIGMA_BY_LEVEL,
+        "gabor_gamma_by_level": GABOR_GAMMA_BY_LEVEL,
+        "gabor_pooled_size_by_level": GABOR_POOLED_SIZE_BY_LEVEL,
+
+        "dog_sigmas_by_level": DOG_SIGMAS_BY_LEVEL,
+        "dog_kernel_size_by_level": DOG_KERNEL_SIZE_BY_LEVEL,
+        "dog_pooled_size_by_level": DOG_POOLED_SIZE_BY_LEVEL,
+        "dog_include_signed": DOG_INCLUDE_SIGNED,
+
+        "fft_radial_bins_by_level": FFT_RADIAL_BINS_BY_LEVEL,
+        "fft_orientation_bins_by_level": FFT_ORIENTATION_BINS_BY_LEVEL,
+        "fft_use_log_magnitude": FFT_USE_LOG_MAGNITUDE,
+
+        "steerable_num_orientations_by_level": STEERABLE_NUM_ORIENTATIONS_BY_LEVEL,
+        "steerable_blur_kernel_size_by_level": STEERABLE_BLUR_KERNEL_SIZE_BY_LEVEL,
+        "steerable_blur_sigma_by_level": STEERABLE_BLUR_SIGMA_BY_LEVEL,
+        "steerable_pooled_size_by_level": STEERABLE_POOLED_SIZE_BY_LEVEL,
+        "steerable_include_signed_by_level": STEERABLE_INCLUDE_SIGNED_BY_LEVEL,
+
+        "color_h_bins_by_level": COLOR_H_BINS_BY_LEVEL,
+        "color_s_bins_by_level": COLOR_S_BINS_BY_LEVEL,
+        "color_v_bins_by_level": COLOR_V_BINS_BY_LEVEL,
+        "color_pooled_size_by_level": COLOR_POOLED_SIZE_BY_LEVEL,
+
+        "soft_lbp_sharpness_by_level": SOFT_LBP_SHARPNESS_BY_LEVEL,
+        "soft_lbp_pooled_size_by_level": SOFT_LBP_POOLED_SIZE_BY_LEVEL,
+        "soft_lbp_include_code_stats": SOFT_LBP_INCLUDE_CODE_STATS,
+
+        "shape_edge_orientation_bins_by_level": SHAPE_EDGE_ORIENTATION_BINS_BY_LEVEL,
+        "shape_pooled_size_by_level": SHAPE_POOLED_SIZE_BY_LEVEL,
+        "shape_blur_kernel_size_by_level": SHAPE_BLUR_KERNEL_SIZE_BY_LEVEL,
+        "shape_blur_sigma_by_level": SHAPE_BLUR_SIGMA_BY_LEVEL,
+        "soft_contour_blur_kernel_size_by_level": SOFT_CONTOUR_BLUR_KERNEL_SIZE_BY_LEVEL,
+        "soft_contour_blur_sigma_by_level": SOFT_CONTOUR_BLUR_SIGMA_BY_LEVEL,
+        "soft_contour_sharpness_by_level": SOFT_CONTOUR_SHARPNESS_BY_LEVEL,
+        "soft_contour_threshold_scale_by_level": SOFT_CONTOUR_THRESHOLD_SCALE_BY_LEVEL,
+        "soft_contour_pooled_size_by_level": SOFT_CONTOUR_POOLED_SIZE_BY_LEVEL,
+
+        "curvature_blur_kernel_size_by_level": CURVATURE_BLUR_KERNEL_SIZE_BY_LEVEL,
+        "curvature_blur_sigma_by_level": CURVATURE_BLUR_SIGMA_BY_LEVEL,
+        "curvature_pooled_size_by_level": CURVATURE_POOLED_SIZE_BY_LEVEL,
+        "curvature_include_signed_by_level": CURVATURE_INCLUDE_SIGNED_BY_LEVEL,
+
+        "dims_per_vector": DIMS_PER_VECTOR,
+        "vector_int_min": VECTOR_INT_MIN,
+        "vector_int_max": VECTOR_INT_MAX,
+        "vector_int_center": VECTOR_INT_CENTER,
+        "vector_int_scale": VECTOR_INT_SCALE,
+        "vis_target_similarities": VIS_TARGET_SIMILARITIES,
+
+        "target_similarity_definition": "sim_y = cosine_similarity(centered_2d_chunk_i, centered_2d_chunk_j)",
+
+        "training_vector_mode": "isolated_branch_scale_2d_chunk_only_one_active_position_at_a_time",
+        "visualization_mode": "isolated_branch_scale_2d_chunk_only_one_active_position_per_row",
+
+        "relational_loss_weight": RELATIONAL_LOSS_WEIGHT,
+        "pattern_diversity_weight": PATTERN_DIVERSITY_WEIGHT,
+        "pattern_diversity_strength": PATTERN_DIVERSITY_STRENGTH,
+        "pattern_diversity_ceiling_definition": "ceiling = 1 - strength * (1 - sim_y)",
+        "style_prior_weight": STYLE_PRIOR_WEIGHT,
+
+        "lr": LR,
+        "weight_decay": WEIGHT_DECAY,
+    }
+
+
+def save_generator_checkpoint(generator, optimizer, step, save_dir, filename):
+    os.makedirs(save_dir, exist_ok=True)
+
+    save_path = os.path.join(save_dir, filename)
+    torch.save(checkpoint_payload(generator, optimizer, step), save_path)
+    print(f"Saved checkpoint: {save_path}")
+
+
+# ============================================================
+# Main
+# ============================================================
+
+if __name__ == "__main__":
+    print(f"DEVICE: {DEVICE}")
+    print(f"Z_DIM: {Z_DIM}")
+    print(f"VECTOR_DIM: {VECTOR_DIM}")
+    print(f"IMAGE_SIZE: {IMAGE_SIZE}")
+    print(f"BASE_CHANNELS: {BASE_CHANNELS}")
+    print(f"BATCH_SIZE: {BATCH_SIZE}")
+    print(f"NUM_STEPS: {NUM_STEPS}")
+
+    print(f"NUM_SCALES: {NUM_SCALES}")
+    print(f"RESOLUTION_LEVELS: {RESOLUTION_LEVELS}")
+    print(f"DOWNSAMPLE_STEPS_PER_LEVEL: {DOWNSAMPLE_STEPS_PER_LEVEL}")
+    print(f"LEVEL_LOSS_WEIGHTS: {LEVEL_LOSS_WEIGHTS}")
+
+    print(f"FEATURE_FAMILIES: {FEATURE_FAMILIES}")
+    print(f"FEATURE_FAMILY_LOSS_WEIGHTS: {FEATURE_FAMILY_LOSS_WEIGHTS}")
+    print(f"RESNET_STAGES_PER_LEVEL: {RESNET_STAGES_PER_LEVEL}")
+    print(f"VGG_LAYER_CUTOFF_BY_LEVEL: {VGG_LAYER_CUTOFF_BY_LEVEL}")
+    print(f"MOBILENET_FEATURE_CUTOFF_BY_LEVEL: {MOBILENET_FEATURE_CUTOFF_BY_LEVEL}")
+
+    print(f"HOG_ORIENTATIONS_BY_LEVEL: {HOG_ORIENTATIONS_BY_LEVEL}")
+    print(f"HOG_PIXELS_PER_CELL_BY_LEVEL: {HOG_PIXELS_PER_CELL_BY_LEVEL}")
+    print(f"HOG_CELLS_PER_BLOCK_BY_LEVEL: {HOG_CELLS_PER_BLOCK_BY_LEVEL}")
+    print(f"HOG_BLUR_KERNEL_SIZE_BY_LEVEL: {HOG_BLUR_KERNEL_SIZE_BY_LEVEL}")
+    print(f"HOG_BLUR_SIGMA_BY_LEVEL: {HOG_BLUR_SIGMA_BY_LEVEL}")
+
+    print(f"GABOR_NUM_ORIENTATIONS_BY_LEVEL: {GABOR_NUM_ORIENTATIONS_BY_LEVEL}")
+    print(f"GABOR_WAVELENGTHS_BY_LEVEL: {GABOR_WAVELENGTHS_BY_LEVEL}")
+    print(f"GABOR_KERNEL_SIZE_BY_LEVEL: {GABOR_KERNEL_SIZE_BY_LEVEL}")
+    print(f"GABOR_SIGMA_BY_LEVEL: {GABOR_SIGMA_BY_LEVEL}")
+    print(f"GABOR_GAMMA_BY_LEVEL: {GABOR_GAMMA_BY_LEVEL}")
+    print(f"GABOR_POOLED_SIZE_BY_LEVEL: {GABOR_POOLED_SIZE_BY_LEVEL}")
+
+    print(f"DOG_SIGMAS_BY_LEVEL: {DOG_SIGMAS_BY_LEVEL}")
+    print(f"DOG_KERNEL_SIZE_BY_LEVEL: {DOG_KERNEL_SIZE_BY_LEVEL}")
+    print(f"DOG_POOLED_SIZE_BY_LEVEL: {DOG_POOLED_SIZE_BY_LEVEL}")
+    print(f"DOG_INCLUDE_SIGNED: {DOG_INCLUDE_SIGNED}")
+
+    print(f"FFT_RADIAL_BINS_BY_LEVEL: {FFT_RADIAL_BINS_BY_LEVEL}")
+    print(f"FFT_ORIENTATION_BINS_BY_LEVEL: {FFT_ORIENTATION_BINS_BY_LEVEL}")
+    print(f"FFT_USE_LOG_MAGNITUDE: {FFT_USE_LOG_MAGNITUDE}")
+
+    print(f"STEERABLE_NUM_ORIENTATIONS_BY_LEVEL: {STEERABLE_NUM_ORIENTATIONS_BY_LEVEL}")
+    print(f"STEERABLE_BLUR_KERNEL_SIZE_BY_LEVEL: {STEERABLE_BLUR_KERNEL_SIZE_BY_LEVEL}")
+    print(f"STEERABLE_BLUR_SIGMA_BY_LEVEL: {STEERABLE_BLUR_SIGMA_BY_LEVEL}")
+    print(f"STEERABLE_POOLED_SIZE_BY_LEVEL: {STEERABLE_POOLED_SIZE_BY_LEVEL}")
+
+    print(f"COLOR_H_BINS_BY_LEVEL: {COLOR_H_BINS_BY_LEVEL}")
+    print(f"COLOR_S_BINS_BY_LEVEL: {COLOR_S_BINS_BY_LEVEL}")
+    print(f"COLOR_V_BINS_BY_LEVEL: {COLOR_V_BINS_BY_LEVEL}")
+    print(f"COLOR_POOLED_SIZE_BY_LEVEL: {COLOR_POOLED_SIZE_BY_LEVEL}")
+
+    print(f"SOFT_LBP_SHARPNESS_BY_LEVEL: {SOFT_LBP_SHARPNESS_BY_LEVEL}")
+    print(f"SOFT_LBP_POOLED_SIZE_BY_LEVEL: {SOFT_LBP_POOLED_SIZE_BY_LEVEL}")
+
+    print(f"SHAPE_EDGE_ORIENTATION_BINS_BY_LEVEL: {SHAPE_EDGE_ORIENTATION_BINS_BY_LEVEL}")
+    print(f"SHAPE_POOLED_SIZE_BY_LEVEL: {SHAPE_POOLED_SIZE_BY_LEVEL}")
+    print(f"SHAPE_BLUR_KERNEL_SIZE_BY_LEVEL: {SHAPE_BLUR_KERNEL_SIZE_BY_LEVEL}")
+    print(f"SHAPE_BLUR_SIGMA_BY_LEVEL: {SHAPE_BLUR_SIGMA_BY_LEVEL}")
+
+    print(f"DIMS_PER_VECTOR: {DIMS_PER_VECTOR}")
+    print(f"VECTOR_INT_RANGE: [{VECTOR_INT_MIN}, {VECTOR_INT_MAX}]")
+    print(f"VECTOR_INT_CENTER: {VECTOR_INT_CENTER}")
+    print(f"VECTOR_INT_SCALE: {VECTOR_INT_SCALE}")
+    print(f"VIS_TARGET_SIMILARITIES: {VIS_TARGET_SIMILARITIES}")
+    print("TARGET_SIMILARITY: sim_y = cosine_similarity(centered_2d_chunk_i, centered_2d_chunk_j)")
+
+    print("TRAINING_VECTOR_MODE: isolated branch/scale 2D chunk; only one active position at a time")
+    print("VISUALIZATION_MODE: isolated branch/scale 2D chunk; only one active position per row")
+
+    print(f"RELATIONAL_LOSS_WEIGHT: {RELATIONAL_LOSS_WEIGHT}")
+    print(f"PATTERN_DIVERSITY_WEIGHT: {PATTERN_DIVERSITY_WEIGHT}")
+    print(f"PATTERN_DIVERSITY_STRENGTH: {PATTERN_DIVERSITY_STRENGTH}")
+    print("PATTERN_DIVERSITY_CEILING: ceiling = 1 - strength * (1 - sim_y)")
+    print(f"STYLE_PRIOR_WEIGHT: {STYLE_PRIOR_WEIGHT}")
+    print(f"LR: {LR}")
+    print(f"WEIGHT_DECAY: {WEIGHT_DECAY}")
+
+    os.makedirs(SAMPLE_SAVE_DIR, exist_ok=True)
+    os.makedirs(CHECKPOINT_SAVE_DIR, exist_ok=True)
+
+    generator = StyleGANOrientedGenerator(
+        z_dim=Z_DIM,
+        vector_dim=VECTOR_DIM,
+        image_size=IMAGE_SIZE,
+        base_channels=BASE_CHANNELS,
+        trainable=True,
+    ).to(DEVICE)
+
+    generator.reset_wavelets(DEVICE)
+
+    frozen_prior_generator = copy.deepcopy(generator).to(DEVICE)
+    frozen_prior_generator.eval()
+
+    for p in frozen_prior_generator.parameters():
+        p.requires_grad = False
+
+    hog_features_by_level = nn.ModuleList([
+        FrozenHOGFeatures(
+            image_size=RESOLUTION_LEVELS[level_idx],
+            orientations=HOG_ORIENTATIONS_BY_LEVEL[level_idx],
+            pixels_per_cell=HOG_PIXELS_PER_CELL_BY_LEVEL[level_idx],
+            cells_per_block=HOG_CELLS_PER_BLOCK_BY_LEVEL[level_idx],
+            blur_kernel_size=HOG_BLUR_KERNEL_SIZE_BY_LEVEL[level_idx],
+            blur_sigma=HOG_BLUR_SIGMA_BY_LEVEL[level_idx],
+            use_unsigned_orientation=HOG_USE_UNSIGNED_ORIENTATION_BY_LEVEL[level_idx],
+            gamma_correction=HOG_GAMMA_CORRECTION_BY_LEVEL[level_idx],
+            eps=HOG_EPS,
+        )
+        for level_idx in range(NUM_SCALES)
+    ]).to(DEVICE)
+
+    for hog_features in hog_features_by_level:
+        hog_features.eval()
+        for p in hog_features.parameters():
+            p.requires_grad = False
+
+    resnet_features = FrozenMultilevelResNet18Features(
+        stages_per_level=RESNET_STAGES_PER_LEVEL,
+    ).to(DEVICE)
+    resnet_features.eval()
+    for p in resnet_features.parameters():
+        p.requires_grad = False
+
+    vgg_features = FrozenVGG16EarlyFeatures(
+        layer_cutoffs_by_level=VGG_LAYER_CUTOFF_BY_LEVEL,
+    ).to(DEVICE)
+    vgg_features.eval()
+    for p in vgg_features.parameters():
+        p.requires_grad = False
+
+    mobilenet_features = FrozenMobileNetV3SmallFeatures(
+        cutoffs_by_level=MOBILENET_FEATURE_CUTOFF_BY_LEVEL,
+    ).to(DEVICE)
+    mobilenet_features.eval()
+    for p in mobilenet_features.parameters():
+        p.requires_grad = False
+
+    gabor_features_by_level = nn.ModuleList([
+        FrozenGaborFeatures(
+            num_orientations=GABOR_NUM_ORIENTATIONS_BY_LEVEL[level_idx],
+            wavelengths=GABOR_WAVELENGTHS_BY_LEVEL[level_idx],
+            kernel_size=GABOR_KERNEL_SIZE_BY_LEVEL[level_idx],
+            sigma=GABOR_SIGMA_BY_LEVEL[level_idx],
+            gamma=GABOR_GAMMA_BY_LEVEL[level_idx],
+            pooled_size=GABOR_POOLED_SIZE_BY_LEVEL[level_idx],
+            use_abs_response=GABOR_USE_ABS_RESPONSE,
+            eps=GABOR_EPS,
+        )
+        for level_idx in range(NUM_SCALES)
+    ]).to(DEVICE)
+
+    for gabor_features in gabor_features_by_level:
+        gabor_features.reset_filters(DEVICE)
+        gabor_features.eval()
+        for p in gabor_features.parameters():
+            p.requires_grad = False
+
+    dog_features_by_level = nn.ModuleList([
+        FrozenDoGBlobFeatures(
+            sigmas=DOG_SIGMAS_BY_LEVEL[level_idx],
+            kernel_size=DOG_KERNEL_SIZE_BY_LEVEL[level_idx],
+            pooled_size=DOG_POOLED_SIZE_BY_LEVEL[level_idx],
+            include_signed=DOG_INCLUDE_SIGNED,
+            eps=DOG_EPS,
+        )
+        for level_idx in range(NUM_SCALES)
+    ]).to(DEVICE)
+
+    for dog_features in dog_features_by_level:
+        dog_features.eval()
+        for p in dog_features.parameters():
+            p.requires_grad = False
+
+    fft_features_by_level = nn.ModuleList([
+        FrozenFFTSpectrumFeatures(
+            image_size=RESOLUTION_LEVELS[level_idx],
+            radial_bins=FFT_RADIAL_BINS_BY_LEVEL[level_idx],
+            orientation_bins=FFT_ORIENTATION_BINS_BY_LEVEL[level_idx],
+            use_log_magnitude=FFT_USE_LOG_MAGNITUDE,
+            eps=FFT_EPS,
+        )
+        for level_idx in range(NUM_SCALES)
+    ]).to(DEVICE)
+
+    for fft_features in fft_features_by_level:
+        fft_features.reset_masks(DEVICE)
+        fft_features.eval()
+        for p in fft_features.parameters():
+            p.requires_grad = False
+
+    steerable_features_by_level = nn.ModuleList([
+        FrozenSteerableGradientFeatures(
+            num_orientations=STEERABLE_NUM_ORIENTATIONS_BY_LEVEL[level_idx],
+            blur_kernel_size=STEERABLE_BLUR_KERNEL_SIZE_BY_LEVEL[level_idx],
+            blur_sigma=STEERABLE_BLUR_SIGMA_BY_LEVEL[level_idx],
+            pooled_size=STEERABLE_POOLED_SIZE_BY_LEVEL[level_idx],
+            include_signed=STEERABLE_INCLUDE_SIGNED_BY_LEVEL[level_idx],
+            eps=STEERABLE_EPS,
+        )
+        for level_idx in range(NUM_SCALES)
+    ]).to(DEVICE)
+
+    for steerable_features in steerable_features_by_level:
+        steerable_features.eval()
+        for p in steerable_features.parameters():
+            p.requires_grad = False
+
+    color_features_by_level = nn.ModuleList([
+        FrozenHSVColorFeatures(
+            h_bins=COLOR_H_BINS_BY_LEVEL[level_idx],
+            s_bins=COLOR_S_BINS_BY_LEVEL[level_idx],
+            v_bins=COLOR_V_BINS_BY_LEVEL[level_idx],
+            pooled_size=COLOR_POOLED_SIZE_BY_LEVEL[level_idx],
+            eps=COLOR_EPS,
+        )
+        for level_idx in range(NUM_SCALES)
+    ]).to(DEVICE)
+
+    for color_features in color_features_by_level:
+        color_features.eval()
+        for p in color_features.parameters():
+            p.requires_grad = False
+
+    soft_lbp_features_by_level = nn.ModuleList([
+        FrozenSoftLBPFeatures(
+            sharpness=SOFT_LBP_SHARPNESS_BY_LEVEL[level_idx],
+            pooled_size=SOFT_LBP_POOLED_SIZE_BY_LEVEL[level_idx],
+            include_code_stats=SOFT_LBP_INCLUDE_CODE_STATS,
+            eps=SOFT_LBP_EPS,
+        )
+        for level_idx in range(NUM_SCALES)
+    ]).to(DEVICE)
+
+    for soft_lbp_features in soft_lbp_features_by_level:
+        soft_lbp_features.eval()
+        for p in soft_lbp_features.parameters():
+            p.requires_grad = False
+
+    shape_features_by_level = nn.ModuleList([
+        FrozenShapeEdgeFeatures(
+            orientation_bins=SHAPE_EDGE_ORIENTATION_BINS_BY_LEVEL[level_idx],
+            pooled_size=SHAPE_POOLED_SIZE_BY_LEVEL[level_idx],
+            blur_kernel_size=SHAPE_BLUR_KERNEL_SIZE_BY_LEVEL[level_idx],
+            blur_sigma=SHAPE_BLUR_SIGMA_BY_LEVEL[level_idx],
+            eps=SHAPE_EPS,
+        )
+        for level_idx in range(NUM_SCALES)
+    ]).to(DEVICE)
+
+    for shape_features in shape_features_by_level:
+        shape_features.eval()
+        for p in shape_features.parameters():
+            p.requires_grad = False
+    soft_contour_features_by_level = nn.ModuleList([
+        FrozenSoftContourFeatures(
+            blur_kernel_size=SOFT_CONTOUR_BLUR_KERNEL_SIZE_BY_LEVEL[level_idx],
+            blur_sigma=SOFT_CONTOUR_BLUR_SIGMA_BY_LEVEL[level_idx],
+            sharpness=SOFT_CONTOUR_SHARPNESS_BY_LEVEL[level_idx],
+            threshold_scale=SOFT_CONTOUR_THRESHOLD_SCALE_BY_LEVEL[level_idx],
+            pooled_size=SOFT_CONTOUR_POOLED_SIZE_BY_LEVEL[level_idx],
+            eps=SOFT_CONTOUR_EPS,
+        )
+        for level_idx in range(NUM_SCALES)
+    ]).to(DEVICE)
+
+    for soft_contour_features in soft_contour_features_by_level:
+        soft_contour_features.eval()
+        for p in soft_contour_features.parameters():
+            p.requires_grad = False
+
+    curvature_hessian_features_by_level = nn.ModuleList([
+        FrozenCurvatureHessianFeatures(
+            blur_kernel_size=CURVATURE_BLUR_KERNEL_SIZE_BY_LEVEL[level_idx],
+            blur_sigma=CURVATURE_BLUR_SIGMA_BY_LEVEL[level_idx],
+            pooled_size=CURVATURE_POOLED_SIZE_BY_LEVEL[level_idx],
+            include_signed=CURVATURE_INCLUDE_SIGNED_BY_LEVEL[level_idx],
+            eps=CURVATURE_EPS,
+        )
+        for level_idx in range(NUM_SCALES)
+    ]).to(DEVICE)
+
+    for curvature_hessian_features in curvature_hessian_features_by_level:
+        curvature_hessian_features.eval()
+        for p in curvature_hessian_features.parameters():
+            p.requires_grad = False
+
+    optimizer = torch.optim.AdamW(
+        generator.parameters(),
+        lr=LR,
+        weight_decay=WEIGHT_DECAY,
+    )
+
+    print("Saving initial isolated branch/scale 2D-cosine grid:")
+    make_branch_scale_similarity_grid(
+        generator=generator,
+        z_dim=Z_DIM,
+        device=DEVICE,
+        title="Before training: isolated rows=branch/scale, columns=target 2D cosine similarity",
+        save_path=os.path.join(SAMPLE_SAVE_DIR, "samples_step_0000_initial.png"),
+    )
+
+    save_generator_checkpoint(
+        generator=generator,
+        optimizer=optimizer,
+        step=0,
+        save_dir=CHECKPOINT_SAVE_DIR,
+        filename="generator_step_0000_initial.pth",
+    )
+
+    for step in range(NUM_STEPS):
+        out = train_step(
+            generator=generator,
+            frozen_prior_generator=frozen_prior_generator,
+            hog_features_by_level=hog_features_by_level,
+            resnet_features=resnet_features,
+            gabor_features_by_level=gabor_features_by_level,
+            dog_features_by_level=dog_features_by_level,
+            fft_features_by_level=fft_features_by_level,
+            steerable_features_by_level=steerable_features_by_level,
+            vgg_features=vgg_features,
+            mobilenet_features=mobilenet_features,
+            color_features_by_level=color_features_by_level,
+            soft_lbp_features_by_level=soft_lbp_features_by_level,
+            shape_features_by_level=shape_features_by_level,
+            soft_contour_features_by_level=soft_contour_features_by_level,
+            curvature_hessian_features_by_level=curvature_hessian_features_by_level,
+            optimizer=optimizer,
+            batch_size=BATCH_SIZE,
+            z_dim=Z_DIM,
+            device=DEVICE,
+        )
+
+        if step % 10 == 0:
+            log_msg = " | ".join(
+                [
+                    (
+                        f"{log['feature_family']} "
+                        f"L{log['level_idx']}@{log['resolution']} "
+                        f"w {log['combined_weight']:.3f}: "
+                        f"rel {log['rel_loss']:.4f}, "
+                        f"pattern_div {log['pattern_diversity_penalty']:.4f}, "
+                        f"prior {log['prior_loss']:.4f}, "
+                        f"sim_img {log['avg_img_sim']:.3f}, "
+                        f"sim_y {log['avg_vector_sim']:.3f}, "
+                        f"ceil {log['avg_diversity_ceiling']:.3f}"
+                    )
+                    for log in out["logs"]
+                ]
+            )
+
+            print(
+                f"step {step:05d} | "
+                f"total {out['total_loss']:.6f} | "
+                f"rel {out['rel_loss']:.6f} | "
+                f"pattern_div {out['pattern_diversity_penalty']:.6f} | "
+                f"prior {out['prior_loss']:.6f} | "
+                f"{log_msg}"
+            )
+
+        if step > 0 and step % VIS_EVERY == 0:
+            make_branch_scale_similarity_grid(
+                generator=generator,
+                z_dim=Z_DIM,
+                device=DEVICE,
+                title=f"After {step} steps: isolated rows=branch/scale, columns=target 2D cosine similarity",
+                save_path=os.path.join(
+                    SAMPLE_SAVE_DIR,
+                    f"samples_step_{step:05d}.png",
+                ),
+            )
+
+            save_generator_checkpoint(
+                generator=generator,
+                optimizer=optimizer,
+                step=step,
+                save_dir=CHECKPOINT_SAVE_DIR,
+                filename=f"generator_step_{step:05d}.pth",
+            )
+
+    print("Saving final isolated branch/scale 2D-cosine grid:")
+    make_branch_scale_similarity_grid(
+        generator=generator,
+        z_dim=Z_DIM,
+        device=DEVICE,
+        title="Final: isolated rows=branch/scale, columns=target 2D cosine similarity",
+        save_path=os.path.join(SAMPLE_SAVE_DIR, "samples_step_final.png"),
+    )
+
+    save_generator_checkpoint(
+        generator=generator,
+        optimizer=optimizer,
+        step=NUM_STEPS,
+        save_dir=CHECKPOINT_SAVE_DIR,
+        filename="generator_step_final.pth",
+    )
+
+    final_path = "integer_multiscale_11branch_3d_cosine_isolated_relational_checkpoint.pth"
+    torch.save(
+        checkpoint_payload(generator, optimizer, NUM_STEPS),
+        final_path,
+    )
+
+    print(f"Saved checkpoint: {final_path}")

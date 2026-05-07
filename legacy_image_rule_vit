@@ -1,0 +1,395 @@
+# image_rule_vit.py
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+# ============================================================
+# Patch embedding
+# ============================================================
+
+class PatchEmbed(nn.Module):
+    def __init__(
+        self,
+        image_size=64,
+        patch_size=8,
+        in_channels=3,
+        embed_dim=256,
+    ):
+        super().__init__()
+
+        assert image_size % patch_size == 0
+
+        self.image_size = image_size
+        self.patch_size = patch_size
+        self.num_patches = (image_size // patch_size) ** 2
+
+        self.proj = nn.Conv2d(
+            in_channels,
+            embed_dim,
+            kernel_size=patch_size,
+            stride=patch_size,
+        )
+
+    def forward(self, x):
+        x = self.proj(x)                  # (B, D, Hp, Wp)
+        x = x.flatten(2).transpose(1, 2)  # (B, P, D)
+        return x
+
+
+# ============================================================
+# Image encoder ViT
+# ============================================================
+
+class SmallViTImageEncoder(nn.Module):
+    def __init__(
+        self,
+        image_size=64,
+        patch_size=8,
+        embed_dim=256,
+        depth=4,
+        num_heads=8,
+        mlp_ratio=4.0,
+        dropout=0.0,
+    ):
+        super().__init__()
+
+        self.patch_embed = PatchEmbed(
+            image_size=image_size,
+            patch_size=patch_size,
+            embed_dim=embed_dim,
+        )
+
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+
+        self.pos_embed = nn.Parameter(
+            torch.zeros(1, self.patch_embed.num_patches + 1, embed_dim)
+        )
+
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=num_heads,
+            dim_feedforward=int(embed_dim * mlp_ratio),
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+
+        self.blocks = nn.TransformerEncoder(enc_layer, num_layers=depth)
+        self.norm = nn.LayerNorm(embed_dim)
+
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+
+    def forward(self, images):
+        """
+        images:
+            (B, 3, H, W)
+
+        returns:
+            (B, image_embed_dim)
+        """
+
+        B = images.shape[0]
+
+        x = self.patch_embed(images)
+
+        cls = self.cls_token.expand(B, -1, -1)
+        x = torch.cat([cls, x], dim=1)
+
+        x = x + self.pos_embed
+        x = self.blocks(x)
+        x = self.norm(x)
+
+        return x[:, 0]
+
+
+# ============================================================
+# TabPFN-style Image PFN
+# ============================================================
+
+class ImagePFN(nn.Module):
+    """
+    True PFN-style model.
+
+    Input:
+        context_images:
+            (B, N_context, 3, H, W)
+
+        context_labels:
+            (B, N_context)
+
+        query_images:
+            (B, N_query, 3, H, W)
+
+    Output:
+        query_logits:
+            (B, N_query, 2)
+
+    Meaning:
+        q_theta(y_query | x_query, D_context)
+
+
+    Context examples get image + known binary label.
+    Query examples get image + learned "unknown label" embedding.
+
+    No positional encoding is used across dataset examples because the dataset
+    is a set, not an ordered sequence.
+    """
+
+    def __init__(
+        self,
+        image_size=64,
+        patch_size=8,
+        image_embed_dim=256,
+        image_depth=4,
+        image_heads=8,
+        set_embed_dim=256,
+        set_depth=4,
+        set_heads=8,
+        label_embed_dim=32,
+        dropout=0.0,
+        num_classes=2,
+    ):
+        super().__init__()
+
+        self.num_classes = num_classes
+
+        self.image_encoder = SmallViTImageEncoder(
+            image_size=image_size,
+            patch_size=patch_size,
+            embed_dim=image_embed_dim,
+            depth=image_depth,
+            num_heads=image_heads,
+            dropout=dropout,
+        )
+
+        # 0 label, 1 label, and 2 = unknown/query label
+        self.label_embed = nn.Embedding(num_classes + 1, label_embed_dim)
+        self.unknown_label_id = num_classes
+
+        self.example_proj = nn.Sequential(
+            nn.Linear(image_embed_dim + label_embed_dim, set_embed_dim),
+            nn.GELU(),
+            nn.LayerNorm(set_embed_dim),
+        )
+
+        self.context_type_embed = nn.Parameter(torch.zeros(1, 1, set_embed_dim))
+        self.query_type_embed = nn.Parameter(torch.zeros(1, 1, set_embed_dim))
+
+        set_layer = nn.TransformerEncoderLayer(
+            d_model=set_embed_dim,
+            nhead=set_heads,
+            dim_feedforward=4 * set_embed_dim,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+
+        self.set_transformer = nn.TransformerEncoder(set_layer, num_layers=set_depth)
+        self.set_norm = nn.LayerNorm(set_embed_dim)
+
+        self.query_head = nn.Sequential(
+            nn.Linear(set_embed_dim, set_embed_dim),
+            nn.GELU(),
+            nn.LayerNorm(set_embed_dim),
+            nn.Linear(set_embed_dim, num_classes),
+        )
+
+        nn.init.trunc_normal_(self.context_type_embed, std=0.02)
+        nn.init.trunc_normal_(self.query_type_embed, std=0.02)
+
+    def _encode_images(self, images):
+        """
+        images:
+            (B, N, 3, H, W)
+
+        returns:
+            (B, N, image_embed_dim)
+        """
+
+        B, N, C, H, W = images.shape
+
+        flat = images.reshape(B * N, C, H, W)
+        emb = self.image_encoder(flat)
+        emb = emb.reshape(B, N, -1)
+
+        return emb
+
+    def forward(
+        self,
+        context_images,
+        context_labels,
+        query_images,
+    ):
+        """
+        context_images:
+            (B, N_context, 3, H, W)
+
+        context_labels:
+            (B, N_context)
+
+        query_images:
+            (B, N_query, 3, H, W)
+        """
+
+        B, N_context, C, H, W = context_images.shape
+        _, N_query, _, _, _ = query_images.shape
+
+        context_img_emb = self._encode_images(context_images)
+        query_img_emb = self._encode_images(query_images)
+
+        context_label_emb = self.label_embed(context_labels.long())
+
+        unknown_labels = torch.full(
+            size=(B, N_query),
+            fill_value=self.unknown_label_id,
+            device=query_images.device,
+            dtype=torch.long,
+        )
+
+        query_label_emb = self.label_embed(unknown_labels)
+
+        context_tokens = torch.cat(
+            [context_img_emb, context_label_emb],
+            dim=-1,
+        )
+        context_tokens = self.example_proj(context_tokens)
+        context_tokens = context_tokens + self.context_type_embed
+
+        query_tokens = torch.cat(
+            [query_img_emb, query_label_emb],
+            dim=-1,
+        )
+        query_tokens = self.example_proj(query_tokens)
+        query_tokens = query_tokens + self.query_type_embed
+
+        tokens = torch.cat([context_tokens, query_tokens], dim=1)
+
+        tokens = self.set_transformer(tokens)
+        tokens = self.set_norm(tokens)
+
+        query_tokens_out = tokens[:, N_context:]
+
+        query_logits = self.query_head(query_tokens_out)
+
+        return {
+            "query_logits": query_logits,          # (B, N_query, 2)
+            "query_tokens": query_tokens_out,
+        }
+
+
+# ============================================================
+# PFN loss
+# ============================================================
+
+def image_pfn_loss(outputs, query_labels):
+    """
+    outputs["query_logits"]:
+        (B, N_query, 2)
+
+    query_labels:
+        (B, N_query)
+    """
+
+    logits = outputs["query_logits"]
+
+    loss = F.cross_entropy(
+        logits.reshape(-1, logits.shape[-1]),
+        query_labels.long().reshape(-1),
+    )
+
+    with torch.no_grad():
+        preds = logits.argmax(dim=-1)
+        acc = (preds == query_labels.long()).float().mean()
+
+    return {
+        "loss": loss,
+        "query_acc": acc,
+    }
+
+
+# ============================================================
+# Train/query split helpers
+# ============================================================
+
+def split_context_query(
+    images,
+    binary_labels,
+    num_context=240,
+    shuffle=True,
+):
+    """
+    Splits each synthetic task into context and query sets.
+
+    images:
+        (B, N, 3, H, W)
+
+    binary_labels:
+        (B, N)
+
+    returns:
+        context_images:  (B, num_context, 3, H, W)
+        context_labels:  (B, num_context)
+        query_images:    (B, N - num_context, 3, H, W)
+        query_labels:    (B, N - num_context)
+    """
+
+    B, N = binary_labels.shape
+
+    assert 0 < num_context < N
+
+    if shuffle:
+        perm = torch.randperm(N, device=images.device)
+        images = images[:, perm]
+        binary_labels = binary_labels[:, perm]
+
+    context_images = images[:, :num_context]
+    context_labels = binary_labels[:, :num_context]
+
+    query_images = images[:, num_context:]
+    query_labels = binary_labels[:, num_context:]
+
+    return {
+        "context_images": context_images,
+        "context_labels": context_labels,
+        "query_images": query_images,
+        "query_labels": query_labels,
+    }
+
+
+# ============================================================
+# Collate function for SyntheticImageRuleDataset objects
+# ============================================================
+
+def collate_pfn_tasks(tasks):
+    """
+    Keeps the full task together.
+
+    Main training loop should call split_context_query(...)
+    after moving tensors to DEVICE.
+    """
+
+    images = torch.stack([t.images for t in tasks], dim=0)
+    binary_labels = torch.stack([t.binary_labels for t in tasks], dim=0)
+
+    return {
+        "images": images,
+        "binary_labels": binary_labels,
+        "tasks": tasks,
+    }
+
+
+# ============================================================
+# Backward-compatible aliases
+# ============================================================
+
+# Old name pointed to rule-prediction model.
+# Now it points to the true PFN-style query predictor.
+ImageRulePFN = ImagePFN
+collate_rule_tasks = collate_pfn_tasks
+image_rule_pfn_loss = image_pfn_loss
+

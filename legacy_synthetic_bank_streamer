@@ -1,0 +1,623 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+
+NUM_FEATURE_BRANCHES = 13
+NUM_SCALES = 2
+DIMS_PER_SUBVECTOR = 8
+
+CONDITION_VECTOR_DIM = NUM_FEATURE_BRANCHES * NUM_SCALES * DIMS_PER_SUBVECTOR
+
+# Current baseline checkpoint architecture defaults.
+DEFAULT_Z_DIM = 256
+DEFAULT_IMAGE_SIZE = 64
+DEFAULT_BASE_CHANNELS = 384
+
+# Must match training integer-vector setup.
+VECTOR_INT_MIN = 0
+VECTOR_INT_MAX = 2000
+VECTOR_INT_CENTER = 1000.0
+VECTOR_INT_SCALE = 1000.0
+VECTOR_NORM_EPS = 1e-6
+NEAR_ZERO_VECTOR_NORM = 0.05
+
+
+def int_to_centered_vector(y_int):
+    """
+    Converts integer-grid values to centered values.
+
+    With current settings:
+        0    -> -1.0
+        1000 ->  0.0
+        2000 ->  1.0
+    """
+    return (y_int.float() - VECTOR_INT_CENTER) / VECTOR_INT_SCALE
+
+
+def safe_normalize_vector(y, eps=VECTOR_NORM_EPS):
+    """
+    Normalizes a vector safely.
+
+    Only used for near-zero replacement, matching training.
+    We do NOT normalize every sampled vector.
+    """
+    norm = y.norm(dim=1, keepdim=True)
+
+    fallback = torch.zeros_like(y)
+    fallback[:, 0:1] = 1.0
+
+    return torch.where(
+        norm > eps,
+        y / norm.clamp_min(eps),
+        fallback,
+    )
+
+
+def sample_training_style_active_subvectors(
+    batch_size,
+    dims_per_subvector,
+    device,
+    generator=None,
+):
+    """
+    Matches the training vector-chunk sampling exactly.
+
+    Training behavior:
+        y_int = randint(0, 2000)
+        y = (y_int - 1000) / 1000
+
+    Then:
+        if norm(y) < 0.05:
+            replace with a random unit direction
+
+    Important:
+        We do NOT normalize every active subvector.
+        Magnitudes remain training-like.
+    """
+    y_int = torch.randint(
+        low=VECTOR_INT_MIN,
+        high=VECTOR_INT_MAX + 1,
+        size=(batch_size, dims_per_subvector),
+        device=device,
+        generator=generator,
+    )
+
+    chunks = int_to_centered_vector(y_int)
+
+    near_zero = chunks.norm(dim=1) < NEAR_ZERO_VECTOR_NORM
+
+    if near_zero.any():
+        n = int(near_zero.sum().item())
+
+        replacement = torch.randn(
+            n,
+            dims_per_subvector,
+            device=device,
+            generator=generator,
+        )
+        replacement = safe_normalize_vector(replacement)
+
+        chunks[near_zero] = replacement
+
+    return chunks
+
+
+def sample_single_active_subvector_vectors(
+    batch_size,
+    num_feature_branches,
+    num_scales,
+    dims_per_subvector,
+    device,
+    generator=None,
+):
+    """
+    Samples full conditioning vectors with exactly one active aligned subvector.
+
+    Full vector shape:
+        [B, num_feature_branches * num_scales * dims_per_subvector]
+
+    Current default:
+        [B, 13 * 2 * 3] = [B, 78]
+
+    Important:
+        Active chunks are always aligned to multiples of dims_per_subvector.
+        So there is no cross-contamination between neighboring chunks.
+
+    Example with dims_per_subvector=3:
+        valid starts: 0, 3, 6, 9, ...
+        invalid starts: 1, 2, 4, 5, ...
+
+    Active subvector values match training sampling:
+        integer-centered values in roughly [-1, 1],
+        with only near-zero vectors replaced.
+    """
+    vector_dim = num_feature_branches * num_scales * dims_per_subvector
+    num_chunks = num_feature_branches * num_scales
+
+    vectors = torch.zeros(
+        batch_size,
+        vector_dim,
+        device=device,
+    )
+
+    active_chunk_indices = torch.randint(
+        low=0,
+        high=num_chunks,
+        size=(batch_size,),
+        device=device,
+        generator=generator,
+    )
+
+    active_subvectors = sample_training_style_active_subvectors(
+        batch_size=batch_size,
+        dims_per_subvector=dims_per_subvector,
+        device=device,
+        generator=generator,
+    )
+
+    # Vectorized placement.
+    # Each start is guaranteed to be a multiple of dims_per_subvector.
+    starts = active_chunk_indices * dims_per_subvector
+    offsets = torch.arange(dims_per_subvector, device=device).view(1, -1)
+    cols = starts.view(-1, 1) + offsets
+    rows = torch.arange(batch_size, device=device).view(-1, 1)
+
+    vectors[rows, cols] = active_subvectors
+
+    return vectors, active_chunk_indices, active_subvectors
+
+
+# ============================================================
+# Generator architecture copied from training code
+# ============================================================
+
+def make_wavelet_bank(device):
+    """
+    Must match training.
+
+    If you change the wavelet filter bank during training,
+    update this function before loading/sampling from new checkpoints.
+    """
+    filters = [
+        [[-1, -1, -1], [0, 0, 0], [1, 1, 1]],
+        [[-1, 0, 1], [-1, 0, 1], [-1, 0, 1]],
+        [[0, 1, 1], [-1, 0, 1], [-1, -1, 0]],
+        [[1, 1, 0], [1, 0, -1], [0, -1, -1]],
+        [[0, -1, 0], [-1, 4, -1], [0, -1, 0]],
+        [[-1, -1, -1], [-1, 8, -1], [-1, -1, -1]],
+    ]
+
+    bank = torch.tensor(filters, dtype=torch.float32, device=device)
+    bank = bank / (bank.flatten(1).norm(dim=1).view(-1, 1, 1) + 1e-8)
+    return bank
+
+
+class TiedWaveletConv2d(nn.Module):
+    """
+    Must match training.
+
+    If training changes:
+      - amplitude initialization shape
+      - bias usage
+      - tied-wavelet logic
+      - padding
+    update this class too.
+    """
+
+    def __init__(self, in_channels, out_channels, trainable=False):
+        super().__init__()
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+
+        self.amplitude = nn.Parameter(
+            torch.randn(out_channels, in_channels, 1, 1) * 0.8,
+            requires_grad=trainable,
+        )
+
+        self.bias = nn.Parameter(
+            torch.zeros(out_channels),
+            requires_grad=trainable,
+        )
+
+        self.register_buffer(
+            "wavelet_indices",
+            torch.empty(in_channels, dtype=torch.long),
+        )
+
+    def reset_wavelets(self, bank_size, device):
+        # These indices are overwritten when loading the checkpoint,
+        # because wavelet_indices are saved as buffers in the state_dict.
+        self.wavelet_indices = torch.randint(
+            low=0,
+            high=bank_size,
+            size=(self.in_channels,),
+            device=device,
+        )
+
+    def forward(self, x, wavelet_bank):
+        selected = wavelet_bank[self.wavelet_indices].unsqueeze(0)
+        weight = self.amplitude * selected
+        return F.conv2d(x, weight, bias=self.bias, padding=1)
+
+
+class OrientedBlock(nn.Module):
+    """
+    Must match training.
+
+    If training changes:
+      - to_style dimensions
+      - normalization type
+      - activation
+      - style modulation formula
+    update this class too.
+    """
+
+    def __init__(self, in_ch, out_ch, trainable=False):
+        super().__init__()
+
+        self.conv = TiedWaveletConv2d(in_ch, out_ch, trainable=trainable)
+        self.to_style = nn.Linear(512, out_ch)
+        self.norm = nn.InstanceNorm2d(out_ch, affine=False)
+        self.act = nn.LeakyReLU(0.2, inplace=True)
+
+    def reset_wavelets(self, bank_size, device):
+        self.conv.reset_wavelets(bank_size, device)
+
+    def forward(self, x, w, wavelet_bank):
+        x = self.conv(x, wavelet_bank)
+        x = self.norm(x)
+
+        style = self.to_style(w).view(w.shape[0], -1, 1, 1)
+        x = x * (1.0 + style)
+
+        return self.act(x)
+
+
+class StyleGANOrientedGenerator(nn.Module):
+    
+
+    def __init__(
+        self,
+        z_dim=DEFAULT_Z_DIM,
+        vector_dim=CONDITION_VECTOR_DIM,
+        image_size=DEFAULT_IMAGE_SIZE,
+        base_channels=DEFAULT_BASE_CHANNELS,
+        trainable=False,
+    ):
+        super().__init__()
+
+        assert image_size in [32, 64, 128, 256], (
+            f"Unsupported image_size={image_size}. "
+            "Expected one of [32, 64, 128, 256]."
+        )
+
+        self.z_dim = z_dim
+        self.vector_dim = vector_dim
+        self.image_size = image_size
+
+        input_dim = z_dim + vector_dim
+
+        self.mapping = nn.Sequential(
+            nn.Linear(input_dim, 512),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(512, 512),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(512, 512),
+        )
+
+        self.const = nn.Parameter(
+            torch.randn(1, base_channels, 4, 4),
+            requires_grad=trainable,
+        )
+
+        channels = {
+            4: base_channels,
+            8: base_channels,
+            16: base_channels // 2,
+            32: base_channels // 4,
+            64: base_channels // 8,
+            128: base_channels // 16,
+            256: base_channels // 32,
+        }
+
+        blocks = []
+        res = 8
+        in_ch = channels[4]
+
+        while res <= image_size:
+            out_ch = max(channels[res], 16)
+            blocks.append(OrientedBlock(in_ch, out_ch, trainable=trainable))
+            in_ch = out_ch
+            res *= 2
+
+        self.blocks = nn.ModuleList(blocks)
+        self.to_rgb = nn.Conv2d(in_ch, 3, kernel_size=1)
+
+        self.register_buffer("wavelet_bank", torch.empty(1))
+
+    def reset_wavelets(self, device):
+        self.wavelet_bank = make_wavelet_bank(device)
+        bank_size = self.wavelet_bank.shape[0]
+
+        for block in self.blocks:
+            block.reset_wavelets(bank_size, device)
+
+    def forward(self, z, y):
+        inp = torch.cat([z, y], dim=1)
+        w = self.mapping(inp)
+
+        x = self.const.repeat(z.shape[0], 1, 1, 1)
+
+        for block in self.blocks:
+            x = F.interpolate(
+                x,
+                scale_factor=2,
+                mode="bilinear",
+                align_corners=False,
+            )
+            x = block(x, w, self.wavelet_bank)
+
+        return torch.tanh(self.to_rgb(x))
+
+
+# ============================================================
+# Load trained generator
+# ============================================================
+
+def load_generator(checkpoint_path, device):
+    """
+    Loads the trained generator for sampling.
+
+    Required checkpoint keys:
+      - generator_state_dict
+      - z_dim
+      - vector_dim
+      - image_size
+      - base_channels
+
+    Optional checkpoint keys used for layout checking:
+      - num_scales
+      - feature_families
+      - dims_per_vector
+
+    If checkpoint layout keys are missing, this file falls back to the clear
+    sampling config at the top:
+      - NUM_FEATURE_BRANCHES
+      - NUM_SCALES
+      - DIMS_PER_SUBVECTOR
+    """
+    ckpt = torch.load(checkpoint_path, map_location=device)
+
+    generator = StyleGANOrientedGenerator(
+        z_dim=ckpt["z_dim"],
+        vector_dim=ckpt["vector_dim"],
+        image_size=ckpt["image_size"],
+        base_channels=ckpt["base_channels"],
+        trainable=False,
+    ).to(device)
+
+    generator.reset_wavelets(device)
+
+    # strict=True is good here:
+    # it forces sampling architecture to match training architecture exactly.
+    generator.load_state_dict(ckpt["generator_state_dict"], strict=True)
+
+    generator.eval()
+
+    for p in generator.parameters():
+        p.requires_grad = False
+
+    return generator, ckpt
+
+
+def infer_layout_from_checkpoint_or_config(ckpt):
+    """
+    Returns:
+        num_feature_branches
+        num_scales
+        dims_per_subvector
+        expected_vector_dim
+
+    Preference:
+        1. checkpoint metadata, if present
+        2. top-of-file config fallback
+    """
+    feature_families = ckpt.get("feature_families", None)
+
+    if feature_families is not None:
+        num_feature_branches = len(feature_families)
+    else:
+        num_feature_branches = NUM_FEATURE_BRANCHES
+
+    num_scales = ckpt.get("num_scales", NUM_SCALES)
+    dims_per_subvector = ckpt.get("dims_per_vector", DIMS_PER_SUBVECTOR)
+
+    expected_vector_dim = (
+        int(num_feature_branches)
+        * int(num_scales)
+        * int(dims_per_subvector)
+    )
+
+    return (
+        int(num_feature_branches),
+        int(num_scales),
+        int(dims_per_subvector),
+        int(expected_vector_dim),
+    )
+
+
+# ============================================================
+# Streaming synthetic bank
+# ============================================================
+
+class SyntheticBankStreamer:
+    """
+    Generates image-vector batches on demand.
+
+    Nothing large is saved.
+
+    With the same:
+      - checkpoint
+      - seed
+      - total_images
+      - batch_size
+      - call order
+
+    it regenerates the same synthetic stream.
+
+    Sampling-time knobs you CAN change freely:
+      - total_images
+      - batch_size
+      - seed
+      - device
+
+    Sampling-layout knobs:
+      - num_feature_branches
+      - num_scales
+      - dims_per_subvector
+
+    By default, these are inferred from the checkpoint if possible.
+    If missing from checkpoint, they fall back to the top-of-file config.
+
+    Current default layout:
+      - num_feature_branches = 13
+      - num_scales = 2
+      - dims_per_subvector = 3
+      - vector_dim = 78
+
+    Vector output behavior:
+      - vectors shape: [B, vector_dim]
+      - exactly one aligned subvector is nonzero per sample
+      - all other components are zero
+      - active subvector location is random
+      - active subvector values match training sampling
+    """
+
+    def __init__(
+        self,
+        checkpoint_path,
+        total_images=100_000,
+        batch_size=64,
+        seed=123,
+        device=None,
+
+        # Optional overrides. Leave as None to infer from checkpoint/config.
+        num_feature_branches=None,
+        num_scales=None,
+        dims_per_subvector=None,
+    ):
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+
+        self.generator, self.ckpt = load_generator(checkpoint_path, self.device)
+
+        self.total_images = int(total_images)
+        self.batch_size = int(batch_size)
+        self.seed = int(seed)
+
+        # Loaded from checkpoint. If you update training, these should update
+        # automatically as long as you saved them in torch.save(...).
+        self.z_dim = int(self.ckpt["z_dim"])
+        self.vector_dim = int(self.ckpt["vector_dim"])
+        self.image_size = int(self.ckpt["image_size"])
+        self.base_channels = int(self.ckpt["base_channels"])
+
+        (
+            inferred_num_feature_branches,
+            inferred_num_scales,
+            inferred_dims_per_subvector,
+            inferred_expected_vector_dim,
+        ) = infer_layout_from_checkpoint_or_config(self.ckpt)
+
+        self.num_feature_branches = (
+            int(num_feature_branches)
+            if num_feature_branches is not None
+            else inferred_num_feature_branches
+        )
+
+        self.num_scales = (
+            int(num_scales)
+            if num_scales is not None
+            else inferred_num_scales
+        )
+
+        self.dims_per_subvector = (
+            int(dims_per_subvector)
+            if dims_per_subvector is not None
+            else inferred_dims_per_subvector
+        )
+
+        self.expected_vector_dim = (
+            self.num_feature_branches
+            * self.num_scales
+            * self.dims_per_subvector
+        )
+
+        assert self.vector_dim == self.expected_vector_dim, (
+            f"vector_dim mismatch:\n"
+            f"  checkpoint vector_dim = {self.vector_dim}\n"
+            f"  expected_vector_dim  = {self.expected_vector_dim}\n"
+            f"  num_feature_branches = {self.num_feature_branches}\n"
+            f"  num_scales           = {self.num_scales}\n"
+            f"  dims_per_subvector   = {self.dims_per_subvector}\n"
+            f"\n"
+            f"If this is intentional, pass matching override values into "
+            f"SyntheticBankStreamer(...)."
+        )
+
+        assert self.vector_dim % self.dims_per_subvector == 0, (
+            f"vector_dim={self.vector_dim} must be divisible by "
+            f"dims_per_subvector={self.dims_per_subvector}."
+        )
+
+        self.num_subvectors = self.vector_dim // self.dims_per_subvector
+
+    @torch.no_grad()
+    def batches(self):
+        g = torch.Generator(device=self.device).manual_seed(self.seed)
+
+        generated = 0
+
+        while generated < self.total_images:
+            cur_bs = min(self.batch_size, self.total_images - generated)
+
+            z = torch.randn(
+                cur_bs,
+                self.z_dim,
+                device=self.device,
+                generator=g,
+            )
+
+            vectors, active_subvector_indices, active_subvectors = (
+                sample_single_active_subvector_vectors(
+                    batch_size=cur_bs,
+                    num_feature_branches=self.num_feature_branches,
+                    num_scales=self.num_scales,
+                    dims_per_subvector=self.dims_per_subvector,
+                    device=self.device,
+                    generator=g,
+                )
+            )
+
+            images = self.generator(z, vectors)
+            images = (images.clamp(-1, 1) + 1.0) / 2.0
+
+            indices = torch.arange(
+                generated,
+                generated + cur_bs,
+                device=self.device,
+            )
+
+            generated += cur_bs
+
+            yield {
+                "images": images,                             # (B, 3, H, W), [0, 1]
+                "vectors": vectors,                           # (B, vector_dim), one active subvector only
+                "active_subvector_indices": active_subvector_indices,  # (B,)
+                "active_subvectors": active_subvectors,        # (B, dims_per_subvector)
+                "z": z,                                       # (B, z_dim)
+                "indices": indices,                           # global synthetic index
+            }
+

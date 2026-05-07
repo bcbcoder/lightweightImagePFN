@@ -1,0 +1,443 @@
+import os
+import random
+import torch
+from torch.utils.data import IterableDataset, DataLoader
+
+from legacy_synthetic_bank_streaming import SyntheticBankStreamer
+from legacy_synthetic_rule_tasks2 import SyntheticRuleTaskGenerator
+from legacy_image_rule_vit import (
+    ImagePFN,
+    collate_pfn_tasks,
+    split_context_query,
+    image_pfn_loss,
+)
+
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+CHECKPOINT_PATH = "multiscale/generator_step_57000.pth"
+
+SAVE_DIR = "./image_pfn2_checkpoints_13branch_2_8d"
+
+GLOBAL_SEED = 123
+
+
+# -------------------------
+# Synthetic bank streaming
+# -------------------------
+
+BANK_TOTAL_IMAGES = 100000
+# Must be larger than task_size * num_rules * datasets_per_rule.
+
+BANK_BATCH_SIZE = 64
+# Generator sampling batch size, NOT PFN batch size.
+
+BANK_SEED = 123
+
+
+# -------------------------
+# Synthetic BNN rule tasks
+# -------------------------
+
+TASK_SIZE = 600
+# Each PFN datapoint contains TASK_SIZE image-label pairs.
+
+NUM_CONTEXT = 500
+# Context/train examples given to PFN.
+
+NUM_QUERY = TASK_SIZE - NUM_CONTEXT
+# Query/test examples predicted by PFN.
+
+NUM_RULES = 25
+DATASETS_PER_RULE = 1
+
+RULE_TASK_SEED = 123
+
+PRINT_LABEL_COUNTS = False
+# Monitoring only. Does not balance or modify labels.
+
+
+# -------------------------
+# PFN / ViT model
+# -------------------------
+
+IMAGE_SIZE = 64
+PATCH_SIZE = 8
+
+IMAGE_EMBED_DIM = 256
+IMAGE_DEPTH = 4
+IMAGE_HEADS = 8
+
+SET_EMBED_DIM = 256
+SET_DEPTH = 4
+SET_HEADS = 8
+
+LABEL_EMBED_DIM = 32
+DROPOUT = 0.0
+
+
+# -------------------------
+# Training
+# -------------------------
+
+PFN_BATCH_SIZE = 4
+# One batch item = one synthetic dataset of TASK_SIZE images.
+
+NUM_EPOCHS = 1000
+
+LR = 1e-4
+WEIGHT_DECAY = 0
+# change back to a small weight decay and batch size 30 instead of 20 if needed
+GRAD_ACCUM_STEPS = 4
+MAX_GRAD_NORM = 1.0
+
+PRINT_EVERY = 200
+
+USE_AMP = True
+
+
+# ============================================================
+# Reproducibility
+# ============================================================
+
+def seed_everything(seed):
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+# ============================================================
+# Iterable wrapper
+# ============================================================
+
+class SyntheticRuleTaskIterableDataset(IterableDataset):
+    def __init__(self, task_generator):
+        super().__init__()
+        self.task_generator = task_generator
+
+    def __iter__(self):
+        return self.task_generator.datasets()
+
+
+# ============================================================
+# Checkpoint saving
+# ============================================================
+
+def save_image_pfn_checkpoint(
+    model,
+    optimizer,
+    epoch,
+    global_step,
+    save_path,
+    bank_streamer=None,
+):
+    payload = {
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "epoch": epoch,
+        "global_step": global_step,
+
+        "checkpoint_path": CHECKPOINT_PATH,
+
+        "task_size": TASK_SIZE,
+        "num_context": NUM_CONTEXT,
+        "num_query": NUM_QUERY,
+        "num_rules": NUM_RULES,
+        "datasets_per_rule": DATASETS_PER_RULE,
+
+        "rule_type": "sampled_bayesian_neural_network",
+        "print_label_counts": PRINT_LABEL_COUNTS,
+
+        "image_size": IMAGE_SIZE,
+        "patch_size": PATCH_SIZE,
+        "image_embed_dim": IMAGE_EMBED_DIM,
+        "image_depth": IMAGE_DEPTH,
+        "image_heads": IMAGE_HEADS,
+        "set_embed_dim": SET_EMBED_DIM,
+        "set_depth": SET_DEPTH,
+        "set_heads": SET_HEADS,
+        "label_embed_dim": LABEL_EMBED_DIM,
+        "dropout": DROPOUT,
+
+        "lr": LR,
+        "weight_decay": WEIGHT_DECAY,
+        "grad_accum_steps": GRAD_ACCUM_STEPS,
+        "max_grad_norm": MAX_GRAD_NORM,
+        "use_amp": USE_AMP,
+    }
+
+    if bank_streamer is not None:
+        payload.update(
+            {
+                "bank_vector_dim": bank_streamer.vector_dim,
+                "bank_image_size": bank_streamer.image_size,
+                "bank_z_dim": bank_streamer.z_dim,
+                "bank_base_channels": bank_streamer.base_channels,
+                "bank_num_feature_branches": bank_streamer.num_feature_branches,
+                "bank_num_scales": bank_streamer.num_scales,
+                "bank_dims_per_subvector": bank_streamer.dims_per_subvector,
+                "bank_num_subvectors": bank_streamer.num_subvectors,
+            }
+        )
+
+    torch.save(payload, save_path)
+    print(f"Saved checkpoint: {save_path}")
+
+
+# ============================================================
+# Main
+# ============================================================
+
+def main():
+    seed_everything(GLOBAL_SEED)
+    os.makedirs(SAVE_DIR, exist_ok=True)
+
+    SAVE_EVERY_N_EPOCHS = 3
+
+    print(f"DEVICE: {DEVICE}")
+    print(f"CHECKPOINT_PATH: {CHECKPOINT_PATH}")
+    print(f"TASK_SIZE: {TASK_SIZE}")
+    print(f"NUM_CONTEXT: {NUM_CONTEXT}")
+    print(f"NUM_QUERY: {NUM_QUERY}")
+    print(f"NUM_RULES: {NUM_RULES}")
+    print(f"DATASETS_PER_RULE: {DATASETS_PER_RULE}")
+    print(f"Total requested bank images: {BANK_TOTAL_IMAGES}")
+    print(f"Required images: {TASK_SIZE * NUM_RULES * DATASETS_PER_RULE}")
+    print(f"Saving checkpoint every {SAVE_EVERY_N_EPOCHS} epochs.")
+
+    assert BANK_TOTAL_IMAGES >= TASK_SIZE * NUM_RULES * DATASETS_PER_RULE, (
+        f"BANK_TOTAL_IMAGES={BANK_TOTAL_IMAGES} is too small. "
+        f"Need at least TASK_SIZE * NUM_RULES * DATASETS_PER_RULE = "
+        f"{TASK_SIZE * NUM_RULES * DATASETS_PER_RULE}."
+    )
+
+    # --------------------------------------------------------
+    # 1. Synthetic image/vector streamer
+    # --------------------------------------------------------
+
+    bank_streamer = SyntheticBankStreamer(
+        checkpoint_path=CHECKPOINT_PATH,
+        total_images=BANK_TOTAL_IMAGES,
+        batch_size=BANK_BATCH_SIZE,
+        seed=BANK_SEED,
+        device=DEVICE,
+    )
+
+    print("Loaded synthetic bank streamer.")
+    print(f"Bank image_size: {bank_streamer.image_size}")
+    print(f"Bank vector_dim: {bank_streamer.vector_dim}")
+    print(f"Bank z_dim: {bank_streamer.z_dim}")
+    print(f"Bank base_channels: {bank_streamer.base_channels}")
+    print(f"Bank num_feature_branches: {bank_streamer.num_feature_branches}")
+    print(f"Bank num_scales: {bank_streamer.num_scales}")
+    print(f"Bank dims_per_subvector: {bank_streamer.dims_per_subvector}")
+    print(f"Bank num_subvectors: {bank_streamer.num_subvectors}")
+
+    # --------------------------------------------------------
+    # 2. Synthetic PFN-style task generator with BNN rules
+    # --------------------------------------------------------
+
+    task_generator = SyntheticRuleTaskGenerator(
+        bank_streamer=bank_streamer,
+        task_size=TASK_SIZE,
+        num_rules=NUM_RULES,
+        datasets_per_rule=DATASETS_PER_RULE,
+        seed=RULE_TASK_SEED,
+        print_label_counts=PRINT_LABEL_COUNTS,
+    )
+
+    task_dataset = SyntheticRuleTaskIterableDataset(task_generator)
+
+    loader = DataLoader(
+        task_dataset,
+        batch_size=PFN_BATCH_SIZE,
+        collate_fn=collate_pfn_tasks,
+        num_workers=0,
+        pin_memory=False,
+    )
+
+    print("Created synthetic PFN task loader.")
+    print(f"Total synthetic tasks per full pass: {NUM_RULES * DATASETS_PER_RULE}")
+
+    # --------------------------------------------------------
+    # 3. True PFN model
+    # --------------------------------------------------------
+    print("reached VIT")
+    model = ImagePFN(
+        image_size=IMAGE_SIZE,
+        patch_size=PATCH_SIZE,
+        image_embed_dim=IMAGE_EMBED_DIM,
+        image_depth=IMAGE_DEPTH,
+        image_heads=IMAGE_HEADS,
+        set_embed_dim=SET_EMBED_DIM,
+        set_depth=SET_DEPTH,
+        set_heads=SET_HEADS,
+        label_embed_dim=LABEL_EMBED_DIM,
+        dropout=DROPOUT,
+        num_classes=2,
+    ).to(DEVICE)
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=LR,
+        weight_decay=WEIGHT_DECAY,
+    )
+
+    scaler = torch.cuda.amp.GradScaler(
+        enabled=(USE_AMP and DEVICE == "cuda")
+    )
+
+    print("Created ImagePFN model.")
+
+    # --------------------------------------------------------
+    # 4. Training loop
+    # --------------------------------------------------------
+
+    global_step = 0
+    optimizer.zero_grad(set_to_none=True)
+
+    for epoch in range(NUM_EPOCHS):
+        model.train()
+
+        epoch_loss_sum = 0.0
+        epoch_query_acc_sum = 0.0
+        epoch_batches = 0
+
+        for batch_idx, batch in enumerate(loader):
+            images = batch["images"].to(DEVICE, non_blocking=True)
+            binary_labels = batch["binary_labels"].to(DEVICE, non_blocking=True)
+
+            split = split_context_query(
+                images=images,
+                binary_labels=binary_labels,
+                num_context=NUM_CONTEXT,
+                shuffle=True,
+            )
+
+            with torch.cuda.amp.autocast(enabled=(USE_AMP and DEVICE == "cuda")):
+                outputs = model(
+                    context_images=split["context_images"],
+                    context_labels=split["context_labels"],
+                    query_images=split["query_images"],
+                )
+
+                loss_dict = image_pfn_loss(
+                    outputs=outputs,
+                    query_labels=split["query_labels"],
+                )
+
+                raw_loss = loss_dict["loss"]
+                query_acc = loss_dict["query_acc"]
+
+                loss = raw_loss / GRAD_ACCUM_STEPS
+
+            scaler.scale(loss).backward()
+
+            # ------------------------------------------------
+            # Track full-epoch metrics.
+            # These use the un-divided loss, not the grad-accum loss.
+            # ------------------------------------------------
+
+            epoch_loss_sum += raw_loss.item()
+            epoch_query_acc_sum += query_acc.item()
+            epoch_batches += 1
+
+            if (global_step + 1) % GRAD_ACCUM_STEPS == 0:
+                scaler.unscale_(optimizer)
+
+                if MAX_GRAD_NORM is not None:
+                    torch.nn.utils.clip_grad_norm_(
+                        model.parameters(),
+                        max_norm=MAX_GRAD_NORM,
+                    )
+
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+
+            if global_step % PRINT_EVERY == 0:
+                print(
+                    f"epoch {epoch:03d} | "
+                    f"step {global_step:06d} | "
+                    f"loss {raw_loss.item():.6f} | "
+                    f"query_acc {query_acc.item():.3f}"
+                )
+
+            global_step += 1
+
+        # ----------------------------------------------------
+        # Flush leftover accumulated gradients if epoch length
+        # is not divisible by GRAD_ACCUM_STEPS.
+        # ----------------------------------------------------
+
+        if global_step % GRAD_ACCUM_STEPS != 0:
+            scaler.unscale_(optimizer)
+
+            if MAX_GRAD_NORM is not None:
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    max_norm=MAX_GRAD_NORM,
+                )
+
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+
+        # ----------------------------------------------------
+        # End-of-epoch summary.
+        # ----------------------------------------------------
+
+        avg_epoch_loss = epoch_loss_sum / max(epoch_batches, 1)
+        avg_epoch_query_acc = epoch_query_acc_sum / max(epoch_batches, 1)
+
+        print(
+            f"Finished epoch {epoch:03d} | "
+            f"avg_loss {avg_epoch_loss:.6f} | "
+            f"avg_query_acc {avg_epoch_query_acc:.3f}"
+        )
+
+        # ----------------------------------------------------
+        # Save every N epochs, with a unique filename.
+        # epoch is zero-indexed, so epoch + 1 is the human count.
+        # ----------------------------------------------------
+
+        completed_epoch = epoch + 1
+
+        if completed_epoch % SAVE_EVERY_N_EPOCHS == 0:
+            epoch_save_path = os.path.join(
+                SAVE_DIR,
+                f"image_pfn_epoch_{completed_epoch:03d}_step_{global_step:06d}.pth",
+            )
+
+            save_image_pfn_checkpoint(
+                model=model,
+                optimizer=optimizer,
+                epoch=completed_epoch,
+                global_step=global_step,
+                save_path=epoch_save_path,
+                bank_streamer=bank_streamer,
+            )
+
+    # --------------------------------------------------------
+    # 5. Final save
+    # --------------------------------------------------------
+
+    final_path = os.path.join(
+        SAVE_DIR,
+        f"image_pfn_final_epoch_{NUM_EPOCHS:03d}_step_{global_step:06d}.pth",
+    )
+
+    save_image_pfn_checkpoint(
+        model=model,
+        optimizer=optimizer,
+        epoch=NUM_EPOCHS,
+        global_step=global_step,
+        save_path=final_path,
+        bank_streamer=bank_streamer,
+    )
+
+    print(f"Saved final checkpoint: {final_path}")
+
+
+if __name__ == "__main__":
+    main()
